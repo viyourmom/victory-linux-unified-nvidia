@@ -378,6 +378,9 @@ fi
 # --debug also sets VKD3D_DEBUG=warn, VICTORY_LOG=debug, VICTORY_LOG_FILE
 #   (the PE's stdio is not the terminal under `proton run`, so its log has to
 #   go to a file) and PROTON_LOG=1 with PROTON_LOG_DIR in the cache.
+# VICTORY_SKIP_MOVIES=1  diagnostics builds only: the title's own Bink library
+#   still opens each video, which then says it has one frame, so a test run
+#   reaches what follows it sooner. Off by default; changes no other behaviour.
 #
 # Inherited values win: `set_default` only fills what is unset.
 

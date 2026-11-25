@@ -329,8 +329,18 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
+///
+/// 2^16, not more: one lane at the limit must stay far below the driver's
+/// two seconds per submission. A BVH builder that reads no window
+/// (`XboxBvhBuilder.dll`'s parent walk with atomic counters) had lanes whose
+/// walk did not end at world entry: at 2^20 one dispatch of it ran 1.1 to
+/// 1.7 s whatever its size, alone in a list of thousands of dispatches that
+/// take 40 ms together, and the driver reset the device when it passed 2 s
+/// (CGBJ-VIctory's `2e40053`, measured on a Radeon 8060S). 2^16 keeps such a
+/// dispatch near 0.1 s. This is a cap, not the cure: the walk should end at
+/// its root.
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 16;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -527,6 +537,20 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            // A host that supports only one width refuses a program that
+            // requires the other (`Required WaveSize range [64, 64]`), so
+            // which of the two reasons asked for it matters when that
+            // happens.
+            // This crate keeps no logging of its own (it is used without a
+            // host), so the one line a refusal needs goes to stderr in
+            // diagnostics builds.
+            #[cfg(feature = "diagnostics")]
+            if console_lanes || one_wave && s.lds_dwords > 0 {
+                eprintln!(
+                    "victory: compute wave {wave} required: threads {:?} console_lanes {console_lanes} lds_dwords {}",
+                    cs.threads, s.lds_dwords
+                );
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }

@@ -433,17 +433,33 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        #[cfg(any(test, feature = "diagnostics"))]
+        let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
-            {
-                let scripted = source.scripted_keys();
-                merge_scripted(&mut pads, &scripted);
-            }
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let _ = &mut pads;
+            let scripted = source.scripted_keys();
+            merge_scripted(&mut pads, &scripted);
+            (pads, source.keys(), scripted)
+        };
+        #[cfg(not(any(test, feature = "diagnostics")))]
+        let (pads, keys) = {
+            let mut source = lock(&self.source);
+            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
+        };
+        // A scripted key reaches the title as the key it names too, not only
+        // as a pad button: a menu that only reads the keyboard (no pad is
+        // connected, and the title's own keys are polled) takes it then, and
+        // a run needs no one at the keyboard to leave the menu.
+        #[cfg(any(test, feature = "diagnostics"))]
+        let keys = {
+            let mut keys = keys;
+            for k in &scripted {
+                if !keys.iter().any(|e| e.virtual_key == k.virtual_key) {
+                    keys.push(*k);
+                }
+            }
+            keys
         };
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);

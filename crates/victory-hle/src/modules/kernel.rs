@@ -286,11 +286,25 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     }
 }
 
-/// See [`exit`]; only the current process is logged.
+/// `ExitProcess`: what a title calls on a fatal path of its own (the CRT's
+/// `exit` is separate, and logged). Wine's own ends the process without a
+/// line, so a run that stops here used to look like a silent crash; this one
+/// names the code and the caller, then ends the process as the console does.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title calls ExitProcess");
+    host::exit(code as i32)
+}
+
+/// See [`exit`]. Every call is logged, not only the pseudo handle's: a run
+/// that ends with a code and no crash report is otherwise unaccounted for
+/// (`ExitProcess` and the CRT's `exit` have their own lines).
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
-    if process as isize == -1 {
-        tracing::warn!(code, from = %host::callers(), "title terminates the process");
-    }
+    tracing::warn!(
+        code,
+        current = process as isize == -1,
+        from = %host::callers(),
+        "title terminates a process"
+    );
     host::terminate_process(process, code)
 }
 
@@ -393,6 +407,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(ExitProcess),
         ],
     }
 }

@@ -21,7 +21,9 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
-diagnostics = []
+# The shader crate's switches ride along: a shader that asks for a wave the
+# host refuses says which of its two reasons did.
+diagnostics = ["victory-shader/diagnostics"]
 
 [lints]
 workspace = true

@@ -54,6 +54,12 @@ pub fn registry() -> &'static [HleModule] {
 }
 
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
+    // A diagnostics-only stand-in for one import of a title DLL's
+    // (`VICTORY_SKIP_MOVIES`, which ends the title's videos after a frame).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(address) = modules::bink::replacement(dll, name) {
+        return Some(address);
+    }
     registry()
         .iter()
         .filter(|m| m.serves(dll))

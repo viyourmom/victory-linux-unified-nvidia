@@ -280,3 +280,123 @@ apart, or wait for `wineserver` to exit.
 The world load still stops silently at 13:40:20 (texture computer starts,
 resource allocations, then no line: no panic, no Xid, no NVRM, no OOM entry),
 the same failure as the 13:16 run. Nothing here claims to fix it.
+
+## Three more forks audited: soldsawn, datingesp, CGBJ (2026-11-25)
+
+Fetched as temporary remotes; all removed before the commit below.
+
+### `datingesp-hash/victory-proton`
+
+Not a fork of the code: **four files** — `victory-proton` (a bash launcher),
+`README.md`, a `.gitignore` and `wine/wineserver-view-tree.patch`. Nothing to
+port: `scripts/play-linux.sh` already sets `PROTON_USE_NTSYNC=1`,
+`VKD3D_CONFIG=nodxr`, per-runner prefixes and `VICTORY_LOG_FILE`, and its
+`--debug` writes the log the patch is about. One idea kept in mind rather than
+copied: it lets the vkd3d-proton build be chosen with a folder (`VICTORY_VKD3D_DIR`),
+which is how a tracing build would be A/B'd. Not added; no build to point it
+at on this machine yet.
+
+### `soldsawn/victory-nvidia-8gb`
+
+59 commits on `ffe310e` (the same base as Trexies' fork), 63,754 lines over
+116 files, of which 5,418 are `emit/lower.rs` and 1,164 a new
+`wave64_tests.rs`. Its headline is **wave64 programs in a paired form on
+32-lane hosts** (`26600c6`: two console lanes per host thread, "230 more
+programs pass"). That is the only fix we have seen for our two refused
+compute pipelines (`Required WaveSize range [64, 64], but supported range is
+[32, 32]` on the RTX 3070), and it is a re-architecture of `wave.rs`
+(651 lines changed) with its own test suite — not portable in a session.
+
+Nothing else there was new to us: wide refreshes (`5b7c878`, same switch we
+ported from Trexies), texture mips dropped on the host (`VICTORY_TEXTURE_DROP_MIPS`),
+a shadow SNAPS flush before drop, and `xmem` low-4GiB guards.
+
+### `JordanFromIT/CGBJ-VIctory` (the one to learn from)
+
+**458 commits** ahead of `d2a4bae`, 70,639 lines over 165 files, plus real
+notes: `docs/PROTON-STATUS.md`, `docs/notes/{vram-placement,title-memory-hazards,queue-wait-path,submission-chain}.md`.
+It targets **stock Proton on an RX 7900 XTX** and reports a running world at
+4.3 fps, the opening cutscene lit and finishing, and 5.6 to 10 minute runs
+without a GPU fault — all things we do not have yet. Its notes are the most
+useful single document we have read on this project:
+
+- Every host copy of title memory is a `WRITE_BACK`/`L0` custom heap, which
+  vkd3d-proton turns into GTT (system RAM over PCIe): 8.7 GiB GTT and 10.5 GiB
+  VRAM in their world run. Their frame is ~9,000 commands of a few
+  microseconds each, memory-latency bound, not shader bound.
+- The frame is 12 batches, prepare/execute/wait/copy-back, GPU busy 37 %;
+  copies move ~880 MB per frame for ~65 MB the title wrote (13.6x).
+- `VICTORY_LAZY_VIEWS` is on by default under Wine; `VICTORY_LIST_FREE_FRAMES`
+  fixed a ~1 GB/minute leak; `VICTORY_GI_STANDIN` / `VICTORY_RT_STANDIN`
+  replace GI gathers and unneeded RT passes with a constant.
+
+Ported from it:
+
+1. **`LOOP_LIMIT` 2^16, not 2^20** (`2e40053`). Their measurement: a BVH
+   parent walk in `XboxBvhBuilder.dll` whose lanes never reach a root ran
+   1.1 to 1.7 s per dispatch at 2^20, and the driver reset the device past
+   its 2 s. `crates/victory-shader/src/emit/lower.rs` now caps at 2^16 with
+   their reasoning in the comment.
+2. **`VICTORY_SKIP_MOVIES=1`** (`91318e2`, diagnostics builds). The title's
+   own Bink library still opens the video; a stand-in for its
+   `BinkOpenWithOptions` sets the opened video's frame count to one. New
+   `crates/victory-hle/src/modules/bink.rs`, hooked at the top of
+   `registry::lookup`. Verified in a run: four videos opened and cut.
+3. **Its notes** (the facts above) rather than code.
+
+Not ported, with reasons:
+
+| CGBJ work | Why not |
+| --- | --- |
+| Whole tree (458 commits) | Conflicts in every file; base is 461 commits behind ours. Same conclusion as Trexies' fork. |
+| `VICTORY_BINK_PARK` (`c52e76c`, 378 lines) | Rests the Bink library's polling threads. Plausible but large, and our runs die before video playback shows up as a cost. |
+| `VICTORY_VRAM` placement (`229f2d7`) | Their design notes say it needs no per-view work at preparing; ours has a different copy design. Not a drop-in. |
+| GI/RT stand-ins | Our default is `VKD3D_CONFIG=nodxr`; no DXR passes exist to stand in for. |
+
+Already ours, checked before porting: dropping a draw or dispatch whose table
+gets no dynamic descriptor slots (`33eaf1c` — our `draw.rs` `bind` returns
+`bool`, `DROPPED` counts it); the heap-texture walk lock (`693d198`) — our
+tree has no such walk.
+
+### What the runs now say about the pre-cutscene stop
+
+Seven runs, 75 to 240 s, diagnostics build, `--console series-x`,
+`VICTORY_MEM_STATS=1`, keys every 5 s from 10 s (`VICTORY_KEYS`). Numbers
+from the host (`nvidia-smi`, 2 s samples):
+
+| Run | What changed | VRAM peak | Ends |
+| --- | --- | --- | --- |
+| C | before this session | 7,570 MiB | exit 3 at frame 2279, no report |
+| E | loop cap not yet | 7,851 MiB | survived 120 s (never reached the cutscene) |
+| F | dense keys | 7,851 MiB | exit 3, no report |
+| G | `LOOP_LIMIT` 2^16 | — | exit 3 |
+| H | + `VICTORY_SKIP_MOVIES=1` | — | exit 3 (videos cut, same point) |
+| I | warm shader cache | — | exit 3 |
+| J | cold shader cache | — | exit 3 |
+
+So: **the loop cap did not change the outcome, and the videos are not what
+ends the run.** What is now known:
+
+- It is not an exception: `victory-loader`'s unhandled-exception filter and
+  panic hook write `crashes.log`, and the only report there (`write 0x0`,
+  title code at `+0x2215c35`, `kernel32` thread entry) is from the 13:40 run.
+  The recent runs leave none.
+- It is not `ExitProcess`, `TerminateProcess` or the CRT's `exit`: all three
+  are logged through HLE now (the first two were added this session), and
+  none fires. The title's entry returns 3 instead — `apps/victory/src/main.rs`
+  exits with the code the entry returned, which is why the shell sees 3.
+- It is not video: with every video cut to one frame the run ends at the same
+  point.
+- At that point the host refuses two compute pipelines for requiring wave 64
+  (`Required WaveSize range [64, 64]`, `[32, 32]` supported), and their
+  dispatches are dropped with `a dispatch without a host pipeline dropped`.
+  The wave-reason line added to `lower.rs` did not print even with a cold
+  shader cache, so those two programs get their `WaveSize` from a path other
+  than the compute-window decision; that is the next thing to find.
+- VRAM reaches 7,851 of 8,192 MiB (96 %) before the stop, and RSS peaked at
+  16.2 GB in run C. Neither is proven to be the cause.
+
+Next, in order: find where those two programs get wave 64 (finish the wave
+diagnostic, then either port soldsawn's paired form or relax the requirement
+behind a `VICTORY_*` switch); if that is not it, dump the title's own state
+at the stop with `VICTORY_DUMPS`-style tables on the last frame.
