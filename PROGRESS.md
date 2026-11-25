@@ -11,7 +11,7 @@ checking and testing, never for running a title.
 | --------- | ----------- |
 | `2458e38` | Phase 0: `AUDIT.md` — three-tree topology, per-crate divergence, real build/test results, structural memory map. No source change. |
 | `959e971` | Phase 1: workspace compiles and tests on Linux; `scripts/build-linux.sh` cross-builds the Windows PE with cargo-xwin. |
-| _step2_   | Phase 1: `scripts/play-linux.sh` — runner detection, vkd3d-proton env, XDG caches and saves. |
+| a26f6c1   | Phase 1: `scripts/play-linux.sh` — runner detection, vkd3d-proton env, XDG caches and saves. |
 | _this commit_ | Phase 1: `docs/linux-baseline.md` — commands, measurement tables and the env matrix for boot failures. |
 
 ## Phase 0 — audit (done)
