@@ -70,6 +70,24 @@
 *.7z
 *.rar
 
+# ---------------------------------------------------------------------------
+# Unified-fork additions (Phase 0). Never commit local machine state.
+# ---------------------------------------------------------------------------
+
+# Agent audit scratch: build/test logs and the per-fork worktrees used for the
+# Phase 0 matrix. Worktrees are checkouts of this repo's own branches, not
+# copies of it, and they must never be committed.
+/.audit-logs/
+/.trees/
+
+# Saves and per-machine data folders (the config file above is already
+# ignored; these are the folders a launcher or wineprefix might create).
+/saves/
+/save/
+/saved-games/
+/userdata/
+/victory-data/
+
 # Editor / OS noise
 .vs/
 .idea/
