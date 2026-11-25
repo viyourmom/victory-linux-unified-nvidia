@@ -1098,6 +1098,45 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Host texture bytes past which no new host texture is made:
+/// `VICTORY_TEXTURE_BUDGET_MB`, 6,656 MB by default (an 8 GB card's usable
+/// share after the swap chain, the descriptor heaps and the desktop).
+#[cfg(windows)]
+fn texture_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(6656 << 20, |mb| mb << 20)
+    })
+}
+
+/// Whether a host texture of `bytes` would take the host textures past
+/// [`texture_budget`]; says so as it happens, once per doubling (a
+/// streaming title asks for hundreds in a row).
+#[cfg(windows)]
+fn over_budget(bytes: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let budget = texture_budget();
+    let used = TEXTURE_BYTES.load(Ordering::Relaxed);
+    if used + bytes <= budget {
+        return false;
+    }
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            used,
+            bytes,
+            budget,
+            skipped = n,
+            "host textures at their budget: new ones are not made (VICTORY_TEXTURE_BUDGET_MB)"
+        );
+    }
+    true
+}
+
 /// Live host textures by texture memory: title textures (resource objects
 /// and placed views) of one memory share one.
 #[cfg(windows)]
@@ -1134,6 +1173,28 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
+    //
+    // The card's own memory is finite, and the driver does not fail an
+    // allocation gracefully: the first Linux boot's 8,156 MB of textures on
+    // an 8 GB card ended in `NVRM: Out of memory [NV_ERR_NO_MEMORY]` and a
+    // dead title. Past the budget a new host texture is not made; the title
+    // reads a null texture there, as it does for one whose format the host
+    // refuses, and keeps running.
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a host description and a plain query.
+        let bytes = unsafe {
+            host.device.GetResourceAllocationInfo(
+                0,
+                &[std::ptr::from_ref(&d)
+                    .cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>()
+                    .read_unaligned()],
+            )
+        }
+        .SizeInBytes;
+        if over_budget(bytes) {
+            return None;
+        }
+    }
     let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
     if let Some(k) = key {
         if live.is_some() {

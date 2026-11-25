@@ -66,6 +66,70 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// Bytes in the staging buffers host textures hold: a staging buffer is as
+/// large as the texture it uploads, so a host texture that keeps one is a
+/// second full-size copy of the title's texture memory. With the first
+/// Linux boot's 8,156 MB of textures on an 8 GB card and 16 GB of RAM, the
+/// driver could not allocate at all (`NVRM: Out of memory
+/// [NV_ERR_NO_MEMORY]`). Past the cap the oldest are handed back (see
+/// [`reclaim`]); the host texture has the contents by then.
+static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host textures whose staging buffer is cached, oldest first (weak: a host
+/// texture lets go of its own, and a dead one is skipped).
+static STAGING_HELD: std::sync::Mutex<Vec<std::sync::Weak<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The cap on [`STAGING_BYTES`]: `VICTORY_STAGING_MB`, 1 GiB by default.
+fn staging_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(1024 << 20, |mb| mb << 20)
+    })
+}
+
+/// Bytes of staging buffers alive now.
+pub(crate) fn staging_bytes() -> u64 {
+    STAGING_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Hands back the oldest cached staging buffers past the cap, so the title's
+/// texture set costs one copy in host textures, not two. A list that copied
+/// one holds it until it has run, so nothing in flight reads a freed buffer;
+/// a texture that changes afterwards uploads from title memory again.
+fn reclaim(keep: &Arc<crate::resource::HostTexture>) {
+    let cap = staging_cap();
+    if staging_bytes() <= cap {
+        return;
+    }
+    let mut held = STAGING_HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut i = 0;
+    while staging_bytes() > cap && i < held.len() {
+        let weak = held[i].clone();
+        i += 1;
+        let Some(copy) = weak.upgrade() else { continue };
+        if Arc::ptr_eq(&copy, keep) {
+            continue;
+        }
+        // Never while its lock is held elsewhere: only the cache reference
+        // is taken, a deferred one keeps the buffer alive.
+        copy.staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+    held.retain(|w| w.strong_count() > 0);
+}
+
 /// A host copy or resolve writes `resource`: its host texture's contents
 /// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
@@ -480,6 +544,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
     });
     *held = Some(s.clone());
+    STAGING_BYTES.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    drop(held);
+    STAGING_HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arc::downgrade(&copy));
+    reclaim(&copy);
     Some(s)
 }
 

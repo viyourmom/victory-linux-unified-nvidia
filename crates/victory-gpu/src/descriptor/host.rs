@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -247,8 +248,7 @@ impl HostHeap {
         if !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+        } else if !sampler {                    tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
         Some(h)
     }
@@ -656,15 +656,25 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // This is a descriptor loop: a title clearing its heap walks the
+            // slots one at a time, so a line per slot is a line per slot of
+            // the title's frame budget. The first Linux run logged 621,440
+            // of these (65 MB, synchronously) while loading. Count instead,
+            // and report once per doubling with the highest index reached:
+            // that is what a remap onto the made heap has to cover.
+            static PAST: AtomicU64 = AtomicU64::new(0);
+            static HIGHEST: AtomicU32 = AtomicU32::new(0);
+            static REPORTED: AtomicU64 = AtomicU64::new(0);
+            let seen = PAST.fetch_add(1, Ordering::Relaxed) + 1;
+            let highest = HIGHEST.fetch_max(index, Ordering::Relaxed).max(index);
+            let at = seen.next_power_of_two();
+            if REPORTED.fetch_max(at, Ordering::Relaxed) < at {
                 tracing::warn!(
-                    index,
+                    slots = seen,
+                    highest,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "title slots past the host heap"
                 );
             }
             return None;
