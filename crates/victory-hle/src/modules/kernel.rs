@@ -607,6 +607,9 @@ mod host {
 mod tests {
     use super::*;
 
+    // The name comes from the image list the Windows loader keeps (see the
+    // Windows-only `files` module); off Windows there is no image to name.
+    #[cfg_attr(not(windows), ignore = "asserts Windows image-path behaviour")]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -709,6 +712,8 @@ mod tests {
         );
     }
 
+    // Finding an image by name reads that same list.
+    #[cfg_attr(not(windows), ignore = "asserts Windows module-name lookups")]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

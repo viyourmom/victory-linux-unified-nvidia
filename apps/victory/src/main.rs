@@ -5,9 +5,13 @@
 
 mod census;
 mod inspect;
+// The warm-up and the batch translator make host shaders and pipelines on
+// the host GPU: Windows only (see `victory_gpu::shader_cache`).
+#[cfg(windows)]
 mod prebuild;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -76,6 +80,7 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    #[cfg(windows)]
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -162,6 +167,7 @@ fn main() -> Result<()> {
             disasm,
             effects,
         } => shader::run(paths, verbose || disasm, disasm, effects),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             jobs,
@@ -169,6 +175,7 @@ fn main() -> Result<()> {
             cache: true,
             ..
         } => translate::warm(paths, jobs, pipelines),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,

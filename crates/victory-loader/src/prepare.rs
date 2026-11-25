@@ -177,6 +177,9 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
 
+    // The image under test is this test binary, which is a PE only on
+    // Windows (the test below is gated for the same reason).
+    #[cfg_attr(not(windows), ignore = "needs a PE test binary")]
     #[test]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -204,6 +207,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg_attr(not(windows), ignore = "needs a PE test binary")]
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -273,6 +277,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(windows), ignore = "needs a PE test binary")]
     #[test]
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();

@@ -177,6 +177,9 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    // The path is a drive letter, which only the Windows-only `files`
+    // module can mount; off Windows the path calls answer `NOT_SUPPORTED`.
+    #[cfg_attr(not(windows), ignore = "asserts the drive letter a Windows title sees")]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
@@ -206,13 +209,19 @@ mod tests {
         assert!(drive.ends_with(":\\"), "{drive}");
         // Title file calls on it reach the folder.
         let path = format!("{drive}save.dat\0");
-        let mut attributes = [0u8; 36];
-        let get_attributes = super::super::files::GetFileAttributesExW;
-        let wide: Vec<u16> = path.encode_utf16().collect();
-        assert_ne!(
-            get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
-            0
-        );
+        // The file call itself lives in the Windows-only `files` module.
+        #[cfg(windows)]
+        {
+            let mut attributes = [0u8; 36];
+            let get_attributes = super::super::files::GetFileAttributesExW;
+            let wide: Vec<u16> = path.encode_utf16().collect();
+            assert_ne!(
+                get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+                0
+            );
+        }
+        #[cfg(not(windows))]
+        let _ = &path;
 
         let mut info = SpaceInfo {
             available_free: 0,
