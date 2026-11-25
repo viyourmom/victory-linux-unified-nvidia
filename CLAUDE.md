@@ -25,6 +25,14 @@ Optional read-only references. Before using anything from them, confirm the repo
 - RAM: 16 GB DDR4 (the main constraint; the title reportedly needs ~24 GB)
 - AMD GPU support cannot be tested here. Treat it as optional and last.
 
+## Target stack (what "works" means for late-stage work)
+
+- **vkd3d-proton is the only D3D12 host.** Vulkan 1.3+, portable SPIR-V lowering (no wave-width or AMD-only intrinsic assumptions), `VK_KHR_timeline_semaphore` for fences, `VK_EXT_memory_budget` for the VRAM budget. Anything that only works on one vendor, or only on Windows' own D3D12 runtime, is a bug.
+- **TuxBox's shape is the model** (brcly/TuxBox): a thin Xbox-delta layer over native Proton/Wine - kernel NTSYNC for sync objects, vkd3d-proton for D3D12, Steam Input for pads - instead of re-implementing what the stack already provides. New work goes in the HLE delta only.
+- **Never depend on services the layer does not have** (DRED, PIX, telemetry, Xbox Live): detect and skip.
+- **Host limits are real and may clamp instead of fail.** vkd3d-proton caps a `CBV_SRV_UAV` heap at 1,000,000 descriptors and makes a smaller heap rather than returning an error (seen in the first Linux boot). Read back what was made (`GetDesc`) and log a mismatch; never trust the requested size.
+- **A Windows PE's stdio is not the launching terminal** under `proton run`: a run whose log matters writes it with `VICTORY_LOG_FILE`, because its stderr never reaches the shell.
+
 ## Hard rules
 
 1. **No game files, ever.** Never read, copy, hash, list, or commit anything from the user's game folder. Game paths live only in an untracked `victory.toml` (keep it in `.gitignore`).

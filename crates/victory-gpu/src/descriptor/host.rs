@@ -140,30 +140,40 @@ impl HostHeap {
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
-        let (heap, count, extra) = if sampler {
-            match make(count.max(samplers)) {
-                Ok(heap) => (heap, count, 0),
+        // `asked` is the count handed to the device, kept to compare with the
+        // heap the host actually made: vkd3d-proton clamps a count past its
+        // limit instead of failing, so a successful call can return less.
+        let (heap, count, extra, asked) = if sampler {
+            let asked = count.max(samplers);
+            match make(asked) {
+                Ok(heap) => (heap, count, 0, asked),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+            let wide = (count + DYNAMIC).max(views);
+            match make(wide) {
+                Ok(heap) => (heap, count, DYNAMIC, wide),
+                Err(_) => {
+                    // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
+                    // faults on an index past them, as before the clamp.
+                    let small = count + MIN_DYNAMIC;
+                    match make(small) {
+                        Ok(heap) => (heap, count, MIN_DYNAMIC, small),
+                        Err(e) if small > PORTABLE_VIEWS => {
+                            // shortcut: descriptors past the host's limit are left
+                            // out; a title that reaches them needs remapping.
+                            tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                            let heap = make(PORTABLE_VIEWS).ok()?;
+                            (heap, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC, PORTABLE_VIEWS)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                            return None;
+                        }
+                    }
                 }
             }
         };
@@ -179,6 +189,19 @@ impl HostHeap {
         let (gpu, total) = unsafe {
             (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
         };
+        // The first Linux boot showed vkd3d-proton making a heap smaller
+        // than the title asked for (2,097,152 capped to 1,000,000) while
+        // still succeeding. Translated shaders clamp to `HEAP_VIEWS`, so
+        // every slot between the two does not exist: say so, because
+        // nothing else in that boot reported it.
+        if total < asked {
+            tracing::warn!(
+                asked,
+                total,
+                sampler,
+                "the host made a smaller descriptor heap than asked for"
+            );
+        }
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
             u64::from(total) * u64::from(step),

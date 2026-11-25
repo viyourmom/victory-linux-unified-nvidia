@@ -37,7 +37,8 @@ options:
   --runtime <path>    the runtime itself, overriding --profile
   --debug             verbose, not a build profile: VKD3D_DEBUG=warn,
                       VICTORY_LOG=debug, WINEDEBUG=err+all,warn+loaddll,
-                      PROTON_LOG=1
+                      PROTON_LOG=1, and the runtime's own log to
+                      $XDG_CACHE_HOME/victory/victory.log
   --dry-run           print the environment and the command, run nothing
   --list              list the compatibility layers found, then exit
   -h, --help          this text
@@ -345,16 +346,21 @@ fi
 #
 # VICTORY_CACHE_DIR / VICTORY_DATA_DIR  the runtime's derived data and the
 #   title's persistent storage, kept apart (below $XDG_*, never the repo).
-# VKD3D_CONFIG=dxr,dxr11  vkd3d-proton's DXR; the title lights with ray
-#   tracing and this box has an RTX 3070. `nodxr` disables it to bisect
-#   black shadows; without either, vkd3d-proton enables DXR only when it
-#   judges it safe (`dxr` forces it).
+# VKD3D_CONFIG=nodxr  DXR off by default. Both ways were tried: with
+#   `dxr,dxr11` vkd3d-proton enabled DXR 1.2 and the first boot presented one
+#   all-black frame and then exited; with `nodxr` the window stayed black.
+#   DXR is therefore not what separates working from black, and it is the
+#   larger untested surface under vkd3d-proton, so the safe default is off.
+#   `dxr,dxr11` is how to try ray-traced lighting (RTX 3070 supports it).
 # VKD3D_SHADER_CACHE_PATH  vkd3d-proton's own translated-shader and pipeline
 #   cache (a directory; the runtime's own caches are separate).
 # WINEDEBUG=-all  Wine's fixme spam otherwise buries vkd3d and our lines.
 # VICTORY_LOG  our tracing filter (falls back to RUST_LOG).
-# --debug also sets VKD3D_DEBUG=warn, VICTORY_LOG=debug and PROTON_LOG=1
-#   (with PROTON_LOG_DIR, so the log lands in the cache, not $HOME).
+# PROTON_USE_NTSYNC=1  the kernel's NTSYNC primitive for Wine's sync objects
+#   (CachyOS ships it; the Proton log says "ntsync: up and running").
+# --debug also sets VKD3D_DEBUG=warn, VICTORY_LOG=debug, VICTORY_LOG_FILE
+#   (the PE's stdio is not the terminal under `proton run`, so its log has to
+#   go to a file) and PROTON_LOG=1 with PROTON_LOG_DIR in the cache.
 #
 # Inherited values win: `set_default` only fills what is unset.
 
@@ -390,7 +396,7 @@ set_default() {
 
 set_default VICTORY_CACHE_DIR "$cache_root" '$XDG_CACHE_HOME/victory'
 set_default VICTORY_DATA_DIR "$data_root" '$XDG_DATA_HOME/victory'
-set_default VKD3D_CONFIG "dxr,dxr11" 'dxr,dxr11'
+set_default VKD3D_CONFIG nodxr nodxr
 set_default VKD3D_SHADER_CACHE_PATH "$cache_root/vkd3d" '$XDG_CACHE_HOME/victory/vkd3d'
 # -all mutes Wine's fixme spam, which otherwise buries vkd3d and our lines; a
 # debug run wants the opposite — the loader and DLL errors that explain a
@@ -405,6 +411,10 @@ set_default VICTORY_LOG "$([ "$use_debug" -eq 1 ] && echo debug || echo info)" \
     "$([ "$use_debug" -eq 1 ] && echo debug || echo info)"
 if [ "$use_debug" -eq 1 ]; then
     set_default VKD3D_DEBUG warn warn
+    # The runtime logs to stderr, which under `proton run` is not the
+    # terminal that started it; a file is the only place the next boot's
+    # progress survives.
+    set_default VICTORY_LOG_FILE "$cache_root/victory.log" '$XDG_CACHE_HOME/victory/victory.log'
     # PROTON_LOG is Proton's own switch; plain Wine has no such variable and
     # would only carry a stray entry.
     case $runner_kind in
@@ -421,6 +431,7 @@ proton)
     # and a Steam client directory to borrow the runtime from.
     set_default STEAM_COMPAT_DATA_PATH "$prefix" "$prefix_shown"
     set_default STEAM_COMPAT_CLIENT_INSTALL_PATH "$(steam_client)" "$(steam_client)"
+    set_default PROTON_USE_NTSYNC 1 1
     ;;
 umu-run)
     # umu-run wants PROTONPATH (a Proton folder) and names its prefix in
@@ -430,6 +441,7 @@ umu-run)
     fi
     set_default WINEPREFIX "$prefix" "$prefix_shown"
     set_default GAMEID 0 0
+    set_default PROTON_USE_NTSYNC 1 1
     ;;
 wine)
     set_default WINEPREFIX "$prefix" "$prefix_shown"
@@ -498,6 +510,9 @@ for dir_name in VICTORY_CACHE_DIR VICTORY_DATA_DIR VKD3D_SHADER_CACHE_PATH PROTO
         directories+=("$dir")
     fi
 done
+if log_file=$(dir_value VICTORY_LOG_FILE); then
+    directories+=("$(dirname "$log_file")")
+fi
 mkdir -p "${directories[@]}"
 
 for i in "${!names[@]}"; do
