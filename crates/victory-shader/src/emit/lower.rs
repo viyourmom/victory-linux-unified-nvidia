@@ -540,14 +540,17 @@ impl<'a> Lower<'a> {
             // A host that supports only one width refuses a program that
             // requires the other (`Required WaveSize range [64, 64]`), so
             // which of the two reasons asked for it matters when that
-            // happens.
-            // This crate keeps no logging of its own (it is used without a
-            // host), so the one line a refusal needs goes to stderr in
-            // diagnostics builds.
-            #[cfg(feature = "diagnostics")]
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // happens. This crate keeps no logging of its own (it is used
+            // without a host), so the one line a refusal needs goes to
+            // stderr, behind an environment variable rather than a build
+            // feature: the feature did not reach this crate in the release
+            // the refusals were seen in, and a run is too expensive to lose
+            // to that again.
+            if std::env::var_os("VICTORY_LOG_WAVE").is_some()
+                && (console_lanes || one_wave && s.lds_dwords > 0)
+            {
                 eprintln!(
-                    "victory: compute wave {wave} required: threads {:?} console_lanes {console_lanes} lds_dwords {}",
+                    "victory: compute wave {wave} required: threads {:?} one_wave {one_wave} console_lanes {console_lanes} lds_dwords {}",
                     cs.threads, s.lds_dwords
                 );
             }

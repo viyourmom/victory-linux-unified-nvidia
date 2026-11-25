@@ -455,3 +455,163 @@ from inside the PE; the next step is to correlate a run with
 `journalctl -k -g 'NVRM: Xid'` (this machine's journal had no Xid line for our
 runs, unlike JMAN's report) and with `winedbg`/`WINEDEBUG=+seh` around the
 last frame.
+
+## Part 1: `datingesp-hash/victory-proton` and Wine's view list (2026-11-25)
+
+The repository is **three files** (`README.md`, the `victory-proton` launcher,
+`wine/wineserver-view-tree.patch`, 143 lines), cloned to
+`/tmp/victory-proton-check` and read in full. It contains no VIctory code.
+
+### What the patch fixes
+
+Wine's `server/mapping.c` keeps each process's mapped views in
+`process->views`, a `struct list`, and finds them by walking it:
+
+- `find_mapped_view(process, base)` — every `map`/`unmap` view lookup;
+- `find_mapped_addr(process, addr)` — every address lookup;
+- `is_valid_view_addr(...)` — an overlap test that scanned until it found a
+  view past the range.
+
+A title that aliases GPU memory one page at a time reaches tens of thousands
+of views, so each of those calls becomes O(views): the README measures
+0.5–1 ms per map/unmap with 20,000+ views, wineserver on most of a core, and
+texture uploads stalling for seconds a frame.
+
+The patch adds **an index beside the list**, not a replacement: a
+`struct rb_tree view_tree` from `wine/rbtree.h` keyed by `(process, base)`,
+plus `find_view_at_or_below` (predecessor search by address) and
+`compare_view`. `find_mapped_view` becomes `rb_get`; `find_mapped_addr` a
+predecessor plus a range test; `is_valid_view_addr` a single predecessor test
+("views do not overlap each other, so only the last one starting below the
+end of the range can reach into it"); `free_memory_view` removes the entry.
+The list stays because its order is meaningful (exe first, then load order).
+
+The safety valve matters: if `rb_put` ever finds two views of one process
+sharing a base, `view_tree_unreliable` is set once and every path walks the
+list exactly as before. The patch can make lookups faster, never differently
+correct.
+
+Their measurements, one machine and one scene:
+
+| | stock wineserver | patched |
+|---|---|---|
+| map / unmap | 450–900 / 300–500 µs | 9–12 / 10–15 µs |
+| texture refreshes per frame | 0.2–3 s | 30–57 ms |
+| wineserver CPU | 57–91 % | 3 % |
+
+### Is our wineserver patched? No — checked, not assumed
+
+`Proton-CachyOS Latest` (`cachyos-11.0-20261015-slr`, `wine-11.0 (CachyOS)`)
+ships `files/bin/wineserver` **not stripped**, so a patched build would show
+the new statics. `nm` lists only `rb_remove` (Wine's own rbtree helper) and
+nothing matching `view_tree` / `find_view_at_or_below` / `compare_view`:
+the server walks the list. Wine upstream still keeps `process->views` as a
+list, so any Proton without this out-of-tree patch is unpatched.
+
+Getting it is not a port: their launcher fetches the sources of the *exact*
+Proton release, applies that release's own Wine patches, then this one, and
+builds `wineserver` only, because the server must match its wine. That is a
+Wine build (the patch is Wine's, LGPL-2.1+), not something this repository
+should carry. It is also the only part of the change that can help us: the
+per-call cost is server-side.
+
+### Our side already coalesces the queries
+
+The in-process half is not a to-do; it is done, with these call sites:
+
+- `crates/victory-gpu/src/watch.rs:396-470` (`protect`): pages are gathered
+  into **runs of consecutive pages** and each run costs one `VirtualProtect`
+  (`set(run[0], run[len-1] + 1)`), falling back to one call per page only
+  when the run fails.
+- `watch.rs:231-260` (`runtime_memory`): one `GetWriteWatch` per tracked
+  allocation, and a `VirtualQuery` only when that says nothing is watched.
+- `watch.rs:406-430`, `632-641`: `VirtualQuery` per page survives only on
+  the paths that meet an unguardable or already-unmapped page — the rare
+  case, not per-copy steady state.
+
+So there is no redundant query to cache away: what is left is the server's
+cost per call, which the wineserver patch is about. `VICTORY_MEM_STATS`
+already reports the copy/guard timings that would show it
+(`crates/victory-gpu/src/copystat.rs`).
+
+### Version and environment recommendations, and what was applied
+
+- **`VKD3D_CONFIG=descriptor_heap`** (their README, item 3): "Without it,
+  vkd3d-proton caps shader-visible descriptor heaps at 1,000,000 entries.
+  Games that ask for more fault the GPU within a minute." That is exactly
+  the shape of our log — the title asks for 2,097,153 slots, its highest
+  live slot is 1,245,183, and the host heap is capped at 1,000,000 — and
+  the installed `files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll`
+  does know the option (its strings contain `descriptor_heap`). Diagnoses
+  matching symptoms is not proof it is ours, so it is **not a new default**:
+  the launcher already lets an inherited `VKD3D_CONFIG` win over its
+  `nodxr`, so `VKD3D_CONFIG=nodxr,descriptor_heap` is a one-variable
+  experiment. Documented in the script's environment block.
+- **Proton version.** They require GE-Proton 11-13+, listing two symptoms
+  we have: "Older dxil-spirv generates invalid code for the first
+  mesh-shader pipeline, and VIctory exits with code 3", and in
+  troubleshooting "Exit code 3 at the first 3D scene → GE-Proton is older
+  than 11-13". Installed here: GE-Proton 11-12, Proton-CachyOS
+  `cachyos-11.0-20261015`, Proton-Wineland 11.0, UMU-Proton 11.0-2e. None
+  is 11-13. **This is now the cheapest experiment we have for the exit-3
+  stop**, and it needs no build.
+- **No new override variable.** `PROTONPATH` (read by Proton and umu-run)
+  and `--runner proton:/path` already choose the build, and plain Wine is
+  the last fallback; adding `VKD3D_PROTON_DIR`/`CUSTOM_PROTON_DIR` would be
+  a second way to say the same thing.
+
+## Part 2: paired wave64 — measured, specified, not faked
+
+The two refusals are compute. vkd3d-proton's
+`d3d12_device_validate_shader_meta` compares the `PSV0`
+`WaveLaneCountMin..Max` pair, which `crates/victory-shader/src/emit/container.rs:199`
+writes from `wave_size`, which only the compute branch sets
+(`emit/lower.rs:499-556`): `console_lanes || one_wave && lds_dwords > 0`.
+Nothing else in the crate can declare 64 — the DXIL entry tag 11
+(`emit/shader.rs:837`) and `PSV0` come from the same field.
+
+That gives exactly two possible reasons, and they need different work:
+
+- `console_lanes`: the program reads other lanes (ballots, DPP, permutes,
+  `v_mbcnt`, lane reads, readlane/writelane, lane masks used as data). Two
+  32-lane halves cannot compute a 64-bit ballot without shared memory and a
+  barrier.
+- `one_wave && lds_dwords > 0`: the whole group is one console wave that
+  shares LDS with no barrier, because the console compiler knew all 64 lanes
+  were resident. Splitting it into two host waves makes each half's LDS
+  private and silently loses that sharing — a "fix" that changes results
+  instead of crashing, which is worse.
+
+Neither is reachable by changing metadata: declaring `[32, 32]` on either
+makes the pipeline load and the program wrong. The honest fix is the paired
+lane model (two console lanes per host lane, lane masks kept as a pair,
+DPP within a half, cross-half operations through memory), i.e. what
+`soldsawn`'s `26600c6` (1,863 lines in `lower.rs`, six new modules, 1,164
+lines of tests) and JMAN's `fix/wave64-lane-mask-pair` (332 lines in 10
+files) do on a `lower.rs` that differs from ours by 2,252 lines. Every
+attempt to apply either (`git apply --3way`) conflicts. Writing that by hand
+here, with one 120 s run as the only verification, is precisely the blind
+rewrite this project's rules forbid; it stays a phase of its own, and the
+branches plus their tests are the spec.
+
+This session ran no subagent or `opencode` worker: none is available to the
+agent in this environment, so every check below was done directly.
+
+**What was done instead:** the wave-requirement line existed but was behind
+`cfg(feature = "diagnostics")` and did not appear in the run that produced
+the refusals. It is now behind `VICTORY_LOG_WAVE=1` in every build
+(`emit/lower.rs:541-560`) and prints the wave size, the thread-group size
+and which of the two reasons applied — the one fact the paired-lane design
+needs. The launcher's help and environment notes describe it, and
+`descriptor_heap`.
+
+### The one bounded run (120 s)
+
+`VICTORY_LOG_WAVE=1 VICTORY_MEM_STATS=1 VICTORY_KEYS=… play-linux.sh
+--console series-x --debug`, killed by `timeout` at 120 s (status 124, so
+**no exit 3 in this window**): world streaming, 2,617 host textures at the
+6,974 MB budget, RSS 13,317 MB (peak 13,318), 4.9 fps at 205 ms/frame with
+142 ms in preparation and 14 ms on the GPU. No refusal and no wave line —
+the two compute pipelines are created later than this run got, so their
+reason is still unrecorded. Honest limitation: the run answers "did it
+survive 120 s" (yes, this time) and nothing about the transition.

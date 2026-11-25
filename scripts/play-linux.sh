@@ -63,6 +63,10 @@ Switches this script knows about, all read by the runtime itself:
                                CPUs); =1 forces it, =0 disables it.
   VICTORY_KEYS=<sec>:<key>,... scripted pad/key presses (diagnostics build):
                                VICTORY_KEYS=25:Enter leaves the menu.
+  VICTORY_LOG_WAVE=1           stderr line for every compute shader that
+                               requires a wave size, and why (any build):
+                               vkd3d-proton refuses a 64-lane one on a
+                               32-lane NVIDIA card.
 EOF
 }
 
@@ -369,6 +373,12 @@ fi
 #   DXR is therefore not what separates working from black, and it is the
 #   larger untested surface under vkd3d-proton, so the safe default is off.
 #   `dxr,dxr11` is how to try ray-traced lighting (RTX 3070 supports it).
+#   An inherited VKD3D_CONFIG wins over this default, so
+#   `VKD3D_CONFIG=nodxr,descriptor_heap` tries vkd3d-proton's descriptor-heap
+#   path, which lifts its 1,000,000-entry cap on shader-visible heaps
+#   (datingesp-hash/victory-proton's README recommends it for titles that
+#   ask for more; the installed d3d12core.dll knows the option). Untested
+#   here, and the world's 1.25M-slot heap is why it is worth trying.
 # VKD3D_SHADER_CACHE_PATH  vkd3d-proton's own translated-shader and pipeline
 #   cache (a directory; the runtime's own caches are separate).
 # WINEDEBUG=-all  Wine's fixme spam otherwise buries vkd3d and our lines.
