@@ -13,7 +13,9 @@ checking and testing, never for running a title.
 | `959e971` | Phase 1: workspace compiles and tests on Linux; `scripts/build-linux.sh` cross-builds the Windows PE with cargo-xwin. |
 | `a26f6c1` | Phase 1: `scripts/play-linux.sh` — runner detection, vkd3d-proton env, XDG caches and saves. |
 | `0b208da` | Phase 1: `docs/linux-baseline.md` — commands, measurement tables and the env matrix for boot failures. |
-| _this commit_ | Phase 1: `play-linux.sh` fixups before the first boot — release build by default, one prefix per runner, `Z:` title paths, directories made before exec. |
+| `2163dc2` | Phase 1: `play-linux.sh` fixups before the first boot — release build by default, one prefix per runner, `Z:` title paths, directories made before exec. |
+| `398edf5` | Boot diagnosis: `VICTORY_LOG_FILE` (a Proton run's log has to go to a file), `nodxr` + `PROTON_USE_NTSYNC=1` defaults, warning when the host clamps a descriptor heap. |
+| _this commit_ | Phase 1: `PROGRESS.md` records the first boot attempt and what its logs prove. |
 
 ## Phase 0 — audit (done)
 
@@ -59,9 +61,57 @@ Done:
 - `docs/linux-baseline.md`: the commands and the empty tables for frame time,
   RSS, swap, VRAM and shader warm-up, plus the env matrix for boot failures.
 
-Not done yet: a title boot under a compatibility layer, and therefore every
-runtime number (frame time, RSS, swap, VRAM, shader warm-up). Those need the
-title's own files, so the user runs them.
+### Boot attempt 1 — what the logs prove
+
+Two runs exist: the user's (12:33, `VKD3D_CONFIG=nodxr`, `umu-run`, window
+black) and an instrumented one (12:37, diagnostics build, `dxr,dxr11`,
+`VICTORY_CAPTURE`, 180 s budget).
+
+From `~/.cache/victory/proton/steam-*.log` and the captured frame:
+
+- vkd3d-proton 3.1.0 on the RTX 3070 (driver 620.73.4): DXR 1.0/1.1/1.2
+  enabled, DX Ultimate, SM 6.6-6.8 (6.9 experimental), `VK_EXT_descriptor_buffer`.
+- Swapchain created at **3840×2160**, BufferCount 2, four images,
+  `KHR_present_wait` with a 3-frame latency.
+- Exactly **one frame was presented**, and `frame-1.png` is all black
+  (half-size 1920×1080, largest byte 0).
+- Two view heaps were requested larger than the host's limit
+  (**2,097,152** and **1,310,720** against vkd3d-proton's 1,000,000); our
+  `HEAP_VIEWS` is `1 << 21`.
+- After device setup vkd3d-proton reports the title "stopped creating new
+  PSOs" twice and no draw or dispatch follows: the world never draws.
+- The process ended by itself after 51 s with **exit 58**, no `crashes.log`,
+  and no line of the runtime's own stdout/stderr in either log — hence
+  `VICTORY_LOG_FILE`.
+
+So the stall is after D3D12 device and swapchain creation and before world
+drawing, not in the Wine loader, not in DXR init (which succeeded) and not in
+shader translation of the first PSOs. Because both `nodxr` and `dxr,dxr11`
+runs are black, DXR is not the divider; the safe default is now `nodxr`.
+
+### Merge check (what is actually left to port)
+
+- **upstream**: `git rev-list --count HEAD..upstream` = **0** — already
+  contained, nothing to merge.
+- **ztrx**: 13 commits, all still "absent" as patches because the fork was
+  hand-ported file by file. Content check: `wanted_early`/`note_used` are
+  present, so the pipeline-library work is in; `VICTORY_PIPELINE_WAIT_MS`,
+  `VICTORY_WAVE_WIDE` and `set_host_max_wave` are **absent**.
+- The one boot-shaped stability fix, `e9765a7` ("Fix the device loss
+  introduced by the wave64 update"), makes `VICTORY_WAVE_WIDE` opt-in because
+  that barrier form lost the card. **This tree has no such switch and no
+  wide-wave barrier form**, so there is nothing to port: a port would add a
+  flag for code that does not exist.
+- `d279e69` (configurable pipeline wait) is behaviour-changing and not
+  boot-related; deferred to Phase 4 where it can be measured, per rule 6.
+
+### Still open
+
+- Every runtime number (frame time, RSS, swap, VRAM, warm-up) needs a boot
+  that reaches the world. None exists yet.
+- Whether the descriptor-heap clamp is what keeps the world from drawing:
+  the next boot's `victory.log` now answers it with the new warning.
+- No `--console series-s` run yet.
 
 Known limitations:
 
