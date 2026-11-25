@@ -147,10 +147,11 @@ takes `--runner proton[:PATH] | umu-run | wine`, `--profile release|debug`,
 An inherited `VKD3D_CONFIG` wins over its defaults.
 
 State on the test machine (CachyOS, RTX 3070 8 GB, Ryzen 7 3700X, 16 GB): the
-Vulkan device is created and frames present at 30 fps; a run reaches the world
-load, creates mesh pipelines, and gets into the opening cutscene with working
-audio. The picture is **black** and the run ends silently after about two
-minutes. `PROGRESS.md` has the numbers and what is still open.
+Vulkan device is created, frames present at 30 fps, and presented frames carry
+real content (captured frames are 99.9 to 100 % non-black) through the menu,
+the world load and the opening cutscene, which plays with sound. Two
+`2560x1440` textures still get no host resource, and the run ends silently
+after about two minutes. `PROGRESS.md` has the numbers and what is still open.
 
 Linux-side switches (all off by default unless stated):
 
@@ -162,6 +163,11 @@ Linux-side switches (all off by default unless stated):
 | `VICTORY_MEM_STATS=1` | off | RSS, commit, host textures and staging, once per frame-rate line |
 | `VICTORY_WIDE_REFRESH=0\|1` | on with 4+ CPUs | host copies of title memory refreshed on several threads |
 | `VICTORY_LOG_WAVE=1` | off | one line per compute shader that requires a wave size, and why |
+
+A host texture whose format list the host will not take is made with a
+narrower one instead of being lost, and says so once per format and use:
+`castable formats narrowed: the host does not take the element's whole list`
+with its format, flags, size and which step was used.
 
 ## Commands
 

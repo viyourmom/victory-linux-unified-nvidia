@@ -1086,7 +1086,9 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// format list casting allows (uncompressed among uncompressed, block
 /// formats among block formats of the same block size), but depth ones
 /// (refused in lists on the RX 6700 XT and WARP alike) and typeless ones
-/// (no view takes them).
+/// (no view takes them), and never `format` itself: a cast list names the
+/// *other* formats, and [`castable_lists`] puts the resource's own format in
+/// front of it.
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     let Some(e) = element(format) else {
@@ -1096,6 +1098,55 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
+}
+
+/// The castable-format lists to try for a host texture in `format` with
+/// `flags`, widest first: every format of its element, then its own family,
+/// then itself alone.
+///
+/// vkd3d-proton validates the list against the resource's flags and refuses
+/// the whole description when no format in it supports them:
+///
+/// ```text
+/// err:d3d12_resource_validate_usage: Requested resource flags #5, but no
+///   format in cast list supports it.
+/// err:d3d12_device_GetResourceAllocationInfo3: Invalid resource desc.
+/// ```
+///
+/// With the list built from `castable` alone, the resource's own format is
+/// missing from it (see there), so a texture the host would have taken
+/// without a cast list (`3840x2160`, R8G8B8A8, render target + UAV) was
+/// refused at creation and never made. Every list here names `format`, which
+/// is the format vkd3d-proton reads the flags off, and the narrower ones are
+/// legal resources in their own right: sharing a texture memory between
+/// formats is an optimisation, losing the texture is not.
+pub(crate) fn castable_lists(format: u32, flags: u32) -> Vec<Vec<u32>> {
+    // Render target, depth, unordered access: the uses a host texture can be
+    // made with. Depth textures get no list (refused on the RX 6700 XT and
+    // WARP alike), and neither do ones no shader may write.
+    const DEPTH_BIT: u32 = 2;
+    const USES: u32 = 0x7;
+    if flags & DEPTH_BIT != 0 || flags & USES == 0 {
+        return Vec::new();
+    }
+    let with_self = |formats: Vec<u32>| {
+        let mut list = vec![format];
+        list.extend(formats.into_iter().filter(|&f| f != format));
+        list
+    };
+    let mut lists = vec![
+        with_self(castable(format)),
+        with_self(
+            castable(format)
+                .into_iter()
+                .filter(|&f| family(f) == family(format))
+                .collect(),
+        ),
+        vec![format],
+    ];
+    // A format with no other formats of its element: the three are the same.
+    lists.dedup();
+    lists
 }
 
 /// Host texture bytes past which no new host texture is made:
@@ -1263,9 +1314,14 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
-    if !castable_formats.is_empty()
+    // Widest list first, then the format's own family, then the format
+    // alone: a host that will not take the element's whole list still gets a
+    // legal resource, and the texture existing matters more than its sharing
+    // a memory with another format.
+    let lists = castable_lists(d.format, d.flags);
+    let mut castable_formats = Vec::new();
+    if !lists.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
         // SAFETY: the description has the host layout (checked size).
@@ -1284,37 +1340,50 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             Flags: p.Flags,
             SamplerFeedbackMipRegion: Default::default(),
         };
-        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
-        // SAFETY: a host description and our out pointer; the list and the
-        // clear value live through the call.
-        let made = unsafe {
-            device.CreateCommittedResource3(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc1,
-                D3D12_BARRIER_LAYOUT_COMMON,
-                clear_value,
-                None::<&ID3D12ProtectedResourceSession>,
-                Some(&formats),
-                &mut texture,
-            )
-        };
-        if let Err(e) = made {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(error = %e, desc = ?d, "the host refuses castable formats: textures of one memory in other formats get their own host texture");
-            });
-            texture = None;
-        } else {
-            // The common layout is the common state.
-            initial = 0;
+        let mut refused = None;
+        for (step, list) in lists.iter().enumerate() {
+            let formats: Vec<DXGI_FORMAT> = list.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+            // SAFETY: a host description and our out pointer; the list and the
+            // clear value live through the call.
+            let made = unsafe {
+                device.CreateCommittedResource3(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc1,
+                    D3D12_BARRIER_LAYOUT_COMMON,
+                    clear_value,
+                    None::<&ID3D12ProtectedResourceSession>,
+                    Some(&formats),
+                    &mut texture,
+                )
+            };
+            match made {
+                Ok(()) => {
+                    // The common layout is the common state.
+                    initial = 0;
+                    castable_formats = list.clone();
+                    if step > 0 {
+                        note_narrowed(d, step, list.len());
+                    }
+                    break;
+                }
+                Err(e) => {
+                    texture = None;
+                    refused = Some(e);
+                }
+            }
+        }
+        if texture.is_none()
+            && let Some(e) = refused
+        {
+            tracing::warn!(error = %e, desc = ?d, "the host refuses every castable list: the texture is made without one");
         }
     }
     if texture.is_none() {
         castable_formats.clear();
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        let made = unsafe {
+        let mut made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
@@ -1324,6 +1393,23 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 &mut texture,
             )
         };
+        if made.is_err() && clear_value.is_some() {
+            // A clear value in a format the resource was not made in is an
+            // invalid description too, and the clear is only a hint (it saves
+            // the title the ClearRenderTargetView that follows): the texture
+            // is worth more than the hint.
+            texture = None;
+            made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(d).cast(),
+                    D3D12_RESOURCE_STATES(initial as i32),
+                    None,
+                    &mut texture,
+                )
+            };
+        }
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
@@ -1335,6 +1421,29 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     });
     let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))
+}
+
+/// One line per (format, flags) whose cast list had to be narrowed, because
+/// the widest one is the common case and this is the exception worth
+/// seeing: it is the `3840x2160` render targets that used to be refused
+/// outright (`no host texture`) appearing here instead.
+#[cfg(windows)]
+fn note_narrowed(d: &ResourceDesc, step: usize, formats: usize) {
+    static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&(d.format, d.flags)) || seen.len() >= 16 {
+        return;
+    }
+    seen.push((d.format, d.flags));
+    tracing::info!(
+        format = d.format,
+        flags = d.flags,
+        width = d.width,
+        height = d.height,
+        step,
+        formats,
+        "castable formats narrowed: the host does not take the element's whole list"
+    );
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -2019,6 +2128,25 @@ mod tests {
 
     /// Castable formats: every format of the same element but typeless and
     /// depth ones; block formats among block formats of their block size.
+    #[test]
+    fn castable_lists_name_the_format_and_narrow() {
+        // Render target + UAV, the shape the host refused: every list names
+        // the resource's own format, and the last is the format alone.
+        let lists = castable_lists(28, 5);
+        assert!(lists.iter().all(|l| l.contains(&28)));
+        assert_eq!(lists[0][0], 28, "the resource's own format leads the list");
+        assert_eq!(lists[lists.len() - 1], vec![28]);
+        assert!(lists[1].iter().all(|&f| family(f) == family(28)));
+        // Depth textures get no list at all, and neither do ones no shader
+        // may write to.
+        assert!(castable_lists(28, 2).is_empty());
+        assert!(castable_lists(28, 0).is_empty());
+        // The lists only narrow.
+        for pair in lists.windows(2) {
+            assert!(pair[0].len() >= pair[1].len());
+        }
+    }
+
     #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);

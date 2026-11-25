@@ -767,3 +767,93 @@ Measurement note, for every later run: `timeout` bounds the launcher, not the
 title. Run 2 returned status 124 at 90 s and the PE went on rendering for
 another ~47 s before it ended, which is the window the user watched. A bounded
 run has to kill `victory.exe` too.
+
+## The black picture: castable formats (2026-11-25)
+
+### The failure
+
+vkd3d-proton refused the description of a host texture outright:
+
+```text
+warn:d3d12_resource_validate_usage: Requested resource flags #5, but no format in cast list supports it.
+warn:d3d12_device_GetResourceAllocationInfo3: Invalid resource desc.
+```
+
+`make_texture` (`crates/victory-gpu/src/resource.rs`) built the cast list from
+`castable(format)`, which by construction **excludes the resource's own
+format** (`f != format`: the list names the *other* formats a memory can be
+viewed in). vkd3d-proton reads the resource's uses off the list, so a
+`3840x2160` `R8G8B8A8` render target + UAV had no format in its own list that
+supported `ALLOW_RENDER_TARGET|ALLOW_UNORDERED_ACCESS`, and the whole
+creation failed. The old code then fell back to `CreateCommittedResource`,
+which for a handful of formats also fails (`no host texture`), leaving those
+textures null while 11,000+ draws a frame ran into them.
+
+### What changed
+
+1. **New `castable_lists(format, flags)`**: the lists to try, widest first --
+every format of the element, then the format's own typeless family, then the
+format alone -- and **every list names the resource's own format**, which is
+the one vkd3d-proton reads the flags off. Depth textures and ones no shader
+may write still get no list (unchanged: depth formats are refused in lists on
+AMD and WARP alike).
+2. **`make_texture` tries them in order** and keeps the first the host takes,
+recording that list on the texture so views still share the memory
+(`takes`, `fits`). Falling to a narrower list is an optimisation lost, not a
+texture lost.
+3. **The plain fallback retries without the clear value.** A clear value in a
+format the resource was not made in is an invalid description too, and a
+clear is only a hint (it saves the title a `ClearRenderTargetView`).
+4. **One line per (format, flags)**, so the next run's log answers the
+question directly:
+
+```text
+INFO victory_gpu::resource: castable formats narrowed: the host does not take the element's whole list
+     format=28 flags=5 width=3840 height=2160 step=1 formats=5
+```
+
+A test (`castable_lists_name_the_format_and_narrow`) pins the properties:
+every list names the format, the last is the format alone, they only narrow,
+and a depth use gets no list at all.
+
+### Measured (two bounded release runs, 110 s, `VKD3D_CONFIG=nodxr`)
+
+- The `3840x2160` `format=28 flags=5` render target **is now made**: it appears
+  in the narrowed line at `step=1 formats=5` instead of in
+  `the host refuses castable formats`. 16 distinct (format, flags) pairs were
+  narrowed; none of them is lost.
+- **Two textures still get no host resource**, both `2560x1440`: `format=86`
+  (`ALLOW_RENDER_TARGET|ALLOW_UNORDERED_ACCESS`) and `format=115`
+  (`ALLOW_RENDER_TARGET`). No castable list and no plain creation takes them
+  (`the host refuses every castable list`, then `no host texture`): those two
+  formats have no render-target/UAV form on this stack at all (in DXGI
+  numbering, an XR_BIAS 10-bit display format and a 4-4-4-4 packed one).
+  Making them exist needs a substitute host format **and** the views of them
+  rewritten to it, which is a change of its own.
+- **The picture is not black any more.** A diagnostics run with
+  `VICTORY_KEYS=20:Enter,30:Enter,40:Enter` and `VICTORY_CAPTURE` (the Enter
+  the user asked for; a third launch, after the two the goal allowed) wrote
+  `frame-128` to `frame-2048` at 1920x1080, and they are **99.9 to 100 %
+  non-black**, mean brightness 36.3 -> 141.6, largest byte 255. Before this
+  change the same capture was `max=0` on every frame.
+- That run: device created (no `vr -3`), frame 2048 presented with 11,231
+  draws and 2,587 dispatches, 2 mesh pipelines, host textures 5,906 MB of the
+  5,632 MB budget, RSS peak 14,079 MB, 11.4 fps at 87.5 ms/frame (52.4 ms
+  preparing, 10.6 ms on the GPU) once the world streams.
+- The silent end is unchanged and was not reached in these 110 s runs.
+
+### Forks checked for a companion fix: none to take
+
+- `JordanFromIT/CGBJ-VIctory` and `soldsawn/victory-nvidia-8gb` **never pass a
+  castable list at all**: both call plain `CreateCommittedResource`, so the
+  refusal this tree hit cannot happen in either. Their `create_committed3`
+  stub ignores the title's cast formats exactly as ours does; ours is the only
+  tree that builds its own list, so the fix belongs here.
+- The NVIDIA fork's 3D rendering work is **paired Wave64 on 32-lane GPUs**
+  (`VICTORY_WAVE_PAIRS`, its `#854`): a re-architecture of `lower.rs` plus new
+  modules, the same project the earlier audit named, not a port. Its README
+  also says shadowed areas are black there for the known reason (no ray-traced
+  bounce light), which is a different problem from a fully black screen.
+- CGBJ is RADV-only on an RX 7900 XTX and says NVIDIA is untested.
+- Both were fetched as temporary refs `refs/remotes/research_*` and removed
+  before this commit; the `base-v1` tag that came with CGBJ was removed too.
