@@ -15,7 +15,10 @@ checking and testing, never for running a title.
 | `0b208da` | Phase 1: `docs/linux-baseline.md` — commands, measurement tables and the env matrix for boot failures. |
 | `2163dc2` | Phase 1: `play-linux.sh` fixups before the first boot — release build by default, one prefix per runner, `Z:` title paths, directories made before exec. |
 | `398edf5` | Boot diagnosis: `VICTORY_LOG_FILE` (a Proton run's log has to go to a file), `nodxr` + `PROTON_USE_NTSYNC=1` defaults, warning when the host clamps a descriptor heap. |
-| _this commit_ | Phase 1: `PROGRESS.md` records the first boot attempt and what its logs prove. |
+| `b41d337` | Phase 1: `PROGRESS.md` records the first boot attempt and what its logs prove. |
+| `a1aeebf` | Runtime invariants in `CLAUDE.md`: series-x is the target, the 1,000,000-slot host heap, 16 GB/8 GB discipline, portable Vulkan + NTSYNC, and the evidence loop. |
+| `6ffc235` | The descriptor loop counts instead of logging per slot, staging buffers are capped at 1 GiB, and host textures stop at the card's budget instead of killing the driver. |
+| _this commit_ | `PROGRESS.md`: what the series-x run does now, measured, and the one blocker left. |
 
 ## Phase 0 — audit (done)
 
@@ -119,3 +122,42 @@ Known limitations:
   an untouched file at `HEAD`); deferred to the final verification phase so no
   unrelated code is reformatted mid-audit.
 - No AMD GPU here; anything AMD-specific stays untested.
+
+## Phase 1 loop: series-x on the test machine (measured)
+
+Three runs of the release PE, `--console series-x --debug`, each with the
+Enter that leaves the menu (`VICTORY_KEYS=25:Enter,35:Enter,50:Enter`, a
+diagnostics build). The game renders the legal screens and the menu, then
+loads the world.
+
+| Run | What changed | Outcome |
+| --- | --- | --- |
+| 13:03 | baseline | 621,440-line / 130 MB log flood; host textures 8,156 MB; `NVRM: Out of memory` 13:04:48 |
+| 13:12 | staging capped at 1 GiB | staging 76 MB; host textures 8,223 MB; `NVRM: Out of memory` 13:12:25 |
+| 13:14 | texture budget 6,656 MB + Enter | host textures stay 6,979 MB, 1,024 new ones refused; **no NVRM OOM**; world load starts (texture computer 512x512, `story000` anim RPFs, 126 XMA voices, fade levels 219-228); process gone at frame ~2,279 (13:16:30) |
+
+Per-frame numbers from the last run: 30 fps / 33.3 ms at the menu, 10-12
+draws/frame, 2,404 host textures, staging 76 MB, peak RSS 17 GB on 16 GB of
+RAM with 15.5 GB of zram. The descriptor walk is 2,097,153 slots with the
+highest index 1,245,183, now reported in 19 lines.
+
+Still open, in the order the evidence puts them:
+
+- **The silent end.** No panic, no `win32` exception, no Xid, no device
+  removal, no OOM-kill entry: the process is simply gone, exit 3, at the
+  moment the texture computer starts and 126 XMA voices are enabled. Peak RSS
+  of 17 GB says system memory, so the next step is to find whether it is the
+  title, the emulated memory or the driver's host-side copies (Phase 2's
+  lazy commit and eviction), not to guess.
+- **Host textures are 1:1 with title textures**: 8 GB of them are the title's
+  own resident set, so a budget alone drops detail rather than restoring it.
+  Real eviction needs a reverse index from a host texture to the heap slots
+  that view it (`Viewed` has none), which is the Phase 2 descriptor-recycling
+  work.
+- **Two compute pipelines are refused by vkd3d-proton**: `Required WaveSize
+  range [64, 64], but supported range is [32, 32]` - a wave64 shader on
+  NVIDIA's 32-lane waves. The dispatches are dropped; world ComputeFX work
+  that needs them will be missing. This is the portable-SPIR-V rule, not a
+  driver quirk.
+- **series-s** was not run (stalls before the first present, per the
+  invariants).
