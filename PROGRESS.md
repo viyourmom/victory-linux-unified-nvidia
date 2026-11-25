@@ -857,3 +857,27 @@ and a depth use gets no list at all.
 - CGBJ is RADV-only on an RX 7900 XTX and says NVIDIA is untested.
 - Both were fetched as temporary refs `refs/remotes/research_*` and removed
   before this commit; the `base-v1` tag that came with CGBJ was removed too.
+
+### Confirmed, and the audit closed (2026-11-25)
+
+- The user **watched the release build and confirmed the picture is not black**
+  on screen, which matches the captures above and is the first run of this
+  tree that renders the menu and the opening cutscene instead of a black
+  frame. The fix is in `b78b7c75`.
+- Repo hygiene at the close: `git status --short` clean apart from the ignored
+  `xbox-ver/`, `target/`, `victory.toml`, `.freebuff/` and the two fork
+  worktrees in `.trees/`; `.audit-logs/` (784 KB of run logs and scripts) and
+  the fork worktrees' `target/` dirs (3.4 GB of build output, checkouts kept)
+  were removed.
+- `git grep "/home/befoputer"` finds nothing in tracked files, no `xbox-ver/`
+  path is tracked, and the largest tracked file is 453 KB
+  (`crates/victory-shader/src/emit/lower.rs`), well under 5 MB.
+- Commits are authored `viyourmom <viyourmom@users.noreply.github.com>`.
+- Still open, unchanged: the two `2560x1440` textures (`format=86` RT+UAV,
+  `format=115` RT) have no host resource; the silent end at ~2 minutes; the
+  vkd3d-proton view-heap cap that keeps `VKD3D_CONFIG=nodxr` the default.
+  Those are the first items of the next phase, not of this audit.
+- Phase 0 (audit) and the castable-format fix are **wrapped up**. The branch
+  `phase-0-audit` tracks `burner/phase-0-audit`
+  (`git@github-burner:viyourmom/victory-linux-unified-nvidia.git`). The next
+  phase starts from the plan in `AUDIT.md`.
