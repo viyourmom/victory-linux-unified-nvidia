@@ -33,6 +33,47 @@ Optional read-only references. Before using anything from them, confirm the repo
 - **Host limits are real and may clamp instead of fail.** vkd3d-proton caps a `CBV_SRV_UAV` heap at 1,000,000 descriptors and makes a smaller heap rather than returning an error (seen in the first Linux boot). Read back what was made (`GetDesc`) and log a mismatch; never trust the requested size.
 - **A Windows PE's stdio is not the launching terminal** under `proton run`: a run whose log matters writes it with `VICTORY_LOG_FILE`, because its stderr never reaches the shell.
 
+## Runtime invariants (proved in Phase 1; do not re-litigate)
+
+1. **`--console series-x` is the active boot and rendering target.** It reaches the
+   legal screens and active rendering (2048 frames at 30 fps, 11 draws/frame,
+   1519 host textures / 2603 MB). `--console series-s` stalls before the first
+   present and is not a test target; do not spend cycles on it.
+2. **The host descriptor heap is capped at `1,000,000` slots on NVIDIA + vkd3d-proton**
+   (`934,464` usable title slots after `65,536` internal ones). vkd3d-proton
+   *succeeds* while making a smaller heap than asked for, so read
+   `GetDesc().NumDescriptors` back and never trust the request.
+   - Never hand unmapped 21-bit (`2,097,152`) virtual indices straight to
+     D3D12/vkd3d-proton: a title index past the made heap must be clamped or
+     remapped, not passed through to a shader root view (which has no bounds).
+   - **Never log per slot inside a descriptor write/copy loop.** The first
+     Linux run walked 310,720 consecutive slots past the heap and wrote
+     621,440 log lines (65 MB, synchronously, under a writer mutex) during
+     loading. Use atomic counters plus a rate-limited summary (one line per
+     doubling, highest index reached).
+3. **16 GB RAM / 8 GB VRAM survival discipline.** The kernel has already
+   logged `NVRM: Out of memory [NV_ERR_NO_MEMORY]` for this title. Free
+   transient shader IR / DXIL blobs once a PSO exists (reload from the disk
+   cache), bound and recycle staging/upload buffers and descriptor slots
+   deterministically on GPU fence completion, and respect the real budget
+   (`VK_EXT_memory_budget` / `IDXGIAdapter3::QueryVideoMemoryInfo`) while the
+   world streams. `VICTORY_MEM_STATS=1` (default off) reports live RSS, swap,
+   VRAM budget/usage and pool sizes.
+4. **Universal Vulkan via vkd3d-proton, TuxBox's NTSYNC shape.** Vulkan 1.3+,
+   portable SPIR-V (no AMD-only ISA, no Wave64 assumptions),
+   `VK_KHR_timeline_semaphore` for fences, `VKD3D_CONFIG=nodxr` by default (do
+   not enable the experimental `VKD3D_CONFIG=descriptor_heap` on NVIDIA),
+   `PROTON_USE_NTSYNC=1` with native NT sync primitives on `/dev/ntsync` (no
+   user-space busy-wait spinlocks; sharded or lock-free page-guard tracking),
+   case-insensitive path lookup caching in `modules::files`, and clean
+   Wine/Proton stubs (`ntdll!wine_get_version`) for DRED, PIX and telemetry.
+5. **Evidence loop, not guesses.** Each cycle is: edit -> `cargo check` -> build
+   the release PE -> `timeout`-bounded run with `--console series-x` -> read
+   `~/.cache/victory/victory.log` tail, `$XDG_DATA_HOME/victory/data/crashes.log`
+   and `journalctl -k` (Xid / NVRM / PAT). At most 6 cycles per session; a
+   cycle that changes nothing measurable is a wasted one. Rendering quality is
+   still judged by the user from `VICTORY_CAPTURE` frames, never by the agent.
+
 ## Hard rules
 
 1. **No game files, ever.** Never read, copy, hash, list, or commit anything from the user's game folder. Game paths live only in an untracked `victory.toml` (keep it in `.gitignore`).
