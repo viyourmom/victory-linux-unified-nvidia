@@ -29,9 +29,9 @@ options:
   --exe <path>        the title executable; relative paths are taken from the
                       configured game directory (required)
   --console <model>   series-x (default) or series-s, what the title sees
-  --runner <name>     proton[:PATH] | umu-run | wine (default: auto — the
-                      Proton in a Steam compatibilitytools.d first, with
-                      Proton-CachyOS preferred, then umu-run, then Wine)
+  --runner <name>     proton[:PATH] | umu-run | wine (default: auto —
+                      GE-Proton 11-14 first, then GE-Proton 11-13 or newer,
+                      then Proton-CachyOS, then umu-run, then Wine)
   --profile <name>    release (default) or debug: which build under
                       target/x86_64-pc-windows-msvc to run
   --runtime <path>    the runtime itself, overriding --profile
@@ -54,8 +54,9 @@ Switches this script knows about, all read by the runtime itself:
                                and the host textures and staging buffers.
                                Reporting only; off by default.
   VICTORY_TEXTURE_BUDGET_MB    how much host texture memory to reach before
-                               new textures are refused (default 6656, an
-                               8 GB card's usable share).
+                               new textures are refused (default 5632, an
+                               8 GB card's usable share less the room 16 GB
+                               of RAM leaves for the title's own memory).
   VICTORY_STAGING_MB           the cap on upload staging buffers (default
                                1024); the oldest is given back first.
   VICTORY_WIDE_REFRESH=0|1     host copies refreshed on several threads (on
@@ -134,6 +135,10 @@ esac
 # compatibilitytools.d (or by hand anywhere, named in PROTONPATH). umu-run
 # takes PROTONPATH too. Plain Wine is the last resort: it has no
 # vkd3d-proton of its own unless the system installs one beside it.
+#
+# Which Proton matters here: GE-Proton 11-13 or newer has the dxil-spirv that
+# gets past the exit code 3 the older builds stop at, so those are preferred
+# over CachyOS (see pick_proton).
 
 proton_dirs=(
     "$HOME/.steam/steam/compatibilitytools.d"
@@ -164,24 +169,54 @@ find_protons() {
     done
 }
 
-# Proton-CachyOS is what this machine runs; after it, the newest build by
-# version (GE-Proton11-3 after GE-Proton10-9), whatever its name.
+# The runners this Linux work targets, in order: GE-Proton 11-14 (the first
+# build that got past the exit code 3 and into the opening cutscene on this
+# machine), then any GE-Proton 11-13 or newer, then CachyOS (what the rest of
+# the tree was developed on). An explicit PROTONPATH wins over all of it, and
+# --runner never comes here.
+#
+# A GE-Proton 11-14 whose wineserver carries the view-tree index is built at
+# ~/.local/share/victory/ge-proton11-14-viewtree (PROGRESS.md, Part 3). It is
+# NOT preferred: the one run under it never created a Vulkan device
+# (`vkd3d-proton: Failed to create Vulkan device, vr -3`) and presented a
+# white window, while the stock build got into the cutscene. Ask for it by
+# name to test it: --runner proton:$HOME/.local/share/victory/ge-proton11-14-viewtree
 pick_proton() {
-    local line
-    local -a sorted=() cachy=()
+    local line d
+    local -a sorted=() cachy=() ge1x=()
+    if [ -n "${PROTONPATH:-}" ] && [ -x "$PROTONPATH/proton" ]; then
+        printf '%s\n' "$PROTONPATH"
+        return 0
+    fi
+    for d in \
+        "$HOME/.steam/root/compatibilitytools.d/GE-Proton11-14-x86_64" \
+        "$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-14-x86_64" \
+        "$HOME/.steam/steam/compatibilitytools.d/GE-Proton11-14-x86_64"; do
+        if [ -x "$d/proton" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
     mapfile -t sorted < <(find_protons | sort -t $'\t' -k1,1 -rV)
     [ ${#sorted[@]} -gt 0 ] || return 1
     for line in "${sorted[@]}"; do
         case ${line%%$'\t'*} in
+        # GE-Proton 11-13 or newer (11-13, 11-14, ..., 11-20, 12-x, 13-x).
+        GE-Proton1[1-9]-1[3-9] | GE-Proton1[1-9]-[2-9][0-9] | GE-Proton1[2-9]-*)
+            ge1x+=("$line")
+            ;;
         # The Steam-installed build before a system package
         # (`proton-cachyos-slr`): the former is the one that gets updated.
         Proton-CachyOS*)
-            printf '%s\n' "${line#*$'\t'}"
-            return 0
+            cachy+=("$line")
             ;;
         *[Cc]achyos*) cachy+=("$line") ;;
         esac
     done
+    if [ ${#ge1x[@]} -gt 0 ]; then
+        printf '%s\n' "${ge1x[0]#*$'\t'}"
+        return 0
+    fi
     if [ ${#cachy[@]} -gt 0 ]; then
         printf '%s\n' "${cachy[0]#*$'\t'}"
         return 0
@@ -367,18 +402,21 @@ fi
 #
 # VICTORY_CACHE_DIR / VICTORY_DATA_DIR  the runtime's derived data and the
 #   title's persistent storage, kept apart (below $XDG_*, never the repo).
-# VKD3D_CONFIG=nodxr  DXR off by default. Both ways were tried: with
-#   `dxr,dxr11` vkd3d-proton enabled DXR 1.2 and the first boot presented one
-#   all-black frame and then exited; with `nodxr` the window stayed black.
-#   DXR is therefore not what separates working from black, and it is the
-#   larger untested surface under vkd3d-proton, so the safe default is off.
-#   `dxr,dxr11` is how to try ray-traced lighting (RTX 3070 supports it).
-#   An inherited VKD3D_CONFIG wins over this default, so
-#   `VKD3D_CONFIG=nodxr,descriptor_heap` tries vkd3d-proton's descriptor-heap
-#   path, which lifts its 1,000,000-entry cap on shader-visible heaps
-#   (datingesp-hash/victory-proton's README recommends it for titles that
-#   ask for more; the installed d3d12core.dll knows the option). Untested
-#   here, and the world's 1.25M-slot heap is why it is worth trying.
+# VKD3D_CONFIG=nodxr,descriptor_heap  DXR off, the descriptor-heap path on.
+#   DXR: both ways were tried. With `dxr,dxr11` vkd3d-proton enabled DXR 1.2
+#   and the first boot presented one all-black frame and then exited; with
+#   `nodxr` the window stayed black. DXR is therefore not what separates
+#   working from black, and it is the larger untested surface under
+#   vkd3d-proton, so `dxr,dxr11` is how to try ray-traced lighting (the RTX
+#   3070 supports it) rather than the default.
+#   descriptor_heap lifts vkd3d-proton's 1,000,000-entry cap on shader-visible
+#   heaps. The title's world heap is 4,194,305 slots with live slots up to
+#   1,245,183, so without it everything past the cap is not mirrored
+#   (victory_gpu::descriptor::host says so once). With it, one run (GE-Proton
+#   11-14, this machine) got past the exit code 3 the earlier Proton builds
+#   stopped at and into the opening cutscene. datingesp-hash/victory-proton's
+#   README recommends it for titles asking for more than the cap.
+#   An inherited VKD3D_CONFIG wins over this default.
 # VKD3D_SHADER_CACHE_PATH  vkd3d-proton's own translated-shader and pipeline
 #   cache (a directory; the runtime's own caches are separate).
 # WINEDEBUG=-all  Wine's fixme spam otherwise buries vkd3d and our lines.
@@ -426,7 +464,7 @@ set_default() {
 
 set_default VICTORY_CACHE_DIR "$cache_root" '$XDG_CACHE_HOME/victory'
 set_default VICTORY_DATA_DIR "$data_root" '$XDG_DATA_HOME/victory'
-set_default VKD3D_CONFIG nodxr nodxr
+set_default VKD3D_CONFIG nodxr,descriptor_heap nodxr,descriptor_heap
 set_default VKD3D_SHADER_CACHE_PATH "$cache_root/vkd3d" '$XDG_CACHE_HOME/victory/vkd3d'
 # -all mutes Wine's fixme spam, which otherwise buries vkd3d and our lines; a
 # debug run wants the opposite — the loader and DLL errors that explain a

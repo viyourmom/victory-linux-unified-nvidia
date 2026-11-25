@@ -615,3 +615,115 @@ needs. The launcher's help and environment notes describe it, and
 the two compute pipelines are created later than this run got, so their
 reason is still unrecorded. Honest limitation: the run answers "did it
 survive 120 s" (yes, this time) and nothing about the transition.
+
+## Part 3: the cutscene, the four changes, and the run that went white
+
+### Baseline (the run that got into the cutscene)
+
+`victory-first-cutscene.log`, GE-Proton 11-14 with
+`VKD3D_CONFIG=nodxr,descriptor_heap`: past the exit code 3, world loaded,
+**146 draws/frame**, and the opening cutscene reached.
+
+| What | Before |
+|---|---|
+| Frame | 1,476.6 ms (0.7 fps) |
+| Preparing, host side | 1,028.5 ms |
+| Copies of title memory | 1,768.4 ms for 159.9 MB |
+| Copy-back of GPU writes | 119.3 ms |
+| On the GPU | 35.2 ms |
+| RSS | peak 16,020 MB of 15,910 MB |
+| Host textures | 6,979 MB (budget 6,656 MB) |
+| Descriptor heap | `title slots past the host heap slots=4194305 highest=1245183 count=934464` |
+
+That last line is arithmetic, not a guess: `count` is the host heap's title
+slots, `PORTABLE_VIEWS - MIN_DYNAMIC` = 1,000,000 − 65,536 = **934,464**
+(`descriptor/host.rs:88,98,169`), so every live slot from 934,464 up to
+1,245,183 was never mirrored.
+
+### What changed
+
+1. **Launcher defaults** (`scripts/play-linux.sh`): `VKD3D_CONFIG` defaults to
+   `nodxr,descriptor_heap` (inherited values still win), and `pick_proton`
+   prefers **GE-Proton 11-14**, then any GE-Proton 11-13 or newer, then
+   CachyOS. `PROTONPATH` and `--runner` still override everything.
+2. **The 1M host heap cap is lifted when vkd3d-proton's descriptor-heap path
+   is on** (`crates/victory-gpu/src/descriptor/host.rs`): a new
+   `vkd3d_descriptor_heap()` reads `VKD3D_CONFIG`; when it is set, a heap the
+   host refuses falls back to the **title's own slot count** (dynamic slots
+   0, and they say so when asked) instead of 1,000,000. Without the flag the
+   old cap and `MIN_DYNAMIC` room apply unchanged. Cost of the full heap:
+   ~33 MB of `made`, ~70 MB of `kept`, ~50 MB of stride/mark upload buffers,
+   and the shader-visible heap itself (4,194,305 × 32 B); against that, the
+   texture budget below gives back 1,024 MB.
+3. **Texture budget 6,656 → 5,632 MB** (`crates/victory-gpu/src/resource.rs`):
+   8 GB of VRAM's usable share less what a 16 GB machine has to keep for the
+   title, which is what the 16,020 MB peak above says was missing.
+4. **View-tree wineserver**: `wineserver-view-tree.patch` (datingesp-hash)
+   applied to **GE's own wine source** — ValveSoftware/wine `a47c73f` plus
+   the GE-Proton11-14 tag's full patch series, so `make_requests` produced
+   **protocol 938**, the number the installed client sends (the tag's bare
+   submodule pin gives 931, and that server was refused: `version mismatch
+   931/938`). Built as a 64-bit `wineserver` (`nm` shows `view_tree`,
+   `view_tree_unreliable`), installed in a hardlink copy of the whole Proton
+   tree at `~/.local/share/victory/ge-proton11-14-viewtree` so ntdll's
+   `realpath`-based `bin_dir` lands there; a wrapper at
+   `files/bin/wineserver` proved that ntdll execs this binary, and
+   `wine cmd /c exit` under the tree succeeds. Method: the release's patch
+   script (`patches/protonprep-valve-staging.sh`, wine section only) with
+   `apply_patch`/`apply_all_in_dir` defined; every patch applied, 0 failures.
+
+### The one bounded run (150 s) — white window
+
+`VICTORY_MEM_STATS=1 VICTORY_KEYS=… play-linux.sh --exe game_scarlett_master.exe
+--console series-x --debug` (which now picks the view-tree runner): **exit 58
+after ~40 s** and a **white window**. vkd3d-proton never got a device:
+
+```
+warn: vkd3d_remove_extension: Removing VK_NVX_binary_import extension from the array.
+warn: vkd3d_remove_extension: Removing VK_NVX_image_view_handle extension from the array.
+warn: vkd3d_create_vk_device: Disabled extensions that can cause Vulkan device creation to fail, retrying.
+err:  vkd3d_create_vk_device: Failed to create Vulkan device, vr -3.
+```
+
+The runtime kept presenting frames with `drawn=0` (white). DXVK had found the
+card (`NVIDIA GeForce RTX 3070 (NVIDIA 620.73.4)`), so it is the D3D12 device
+creation that failed, before any heap, pipeline or title memory.
+
+The only difference from the proven configuration was the runner (the tree is
+byte-identical to stock GE-Proton 11-14 apart from `files/bin/wineserver`), so
+**the view-tree runner is no longer the default**; `pick_proton` prefers the
+stock GE-Proton 11-14 again and the patched tree is opt-in with
+`--runner proton:$HOME/.local/share/victory/ge-proton11-14-viewtree` (a
+`README.viewtree` in that tree says the same). Which of the two is at fault is
+**UNVERIFIED**: the patch, or the hand-built server (its objects were compiled
+by hand because the prepared tree's `Makefile` cannot be regenerated there —
+`makedep` fails on the tree's missing wineopenxr sources — so `config.h` came
+from a configure that exited 1 while writing the Makefile).
+
+### Not ported, and why
+
+- **`VICTORY_LAZY_VIEWS`** (CGBJ default on under Wine) needs
+  `victory_gpu::lazy` — 212 lines in CGBJ, `lazy::table_mut()` at ~10 xmem
+  sites (map, unmap, protect, query, `alias_of`) plus the guards in
+  `watch`/`queue` that keep CPU writes coherent. This tree has no such module,
+  and the view-tree wineserver attacks the same cost (each host view makes
+  every map/unmap slower). It is a phase of its own, testable only by A/B.
+- **`VICTORY_LIST_FREE_FRAMES`** (CGBJ closes a leak of ~1 GB/min with it):
+  that leak lived in CGBJ's *loose buffer windows* (`loose.rs`), which this
+  tree does not have; our `HostList` holds `Deferred` steps and a `states` map
+  that `reset()` already clears, and a 600-frame idle window cannot elapse in
+  a 150 s run at under 1 fps, so it could be neither ported nor measured here.
+- **Cutscene lighting / barrier fixes** in CGBJ's `docs/PROTON-STATUS.md` are
+  stand-ins (`VICTORY_GI_STANDIN=0.5`, `VICTORY_RT_STANDIN=1`, a dropped
+  particle pass) for RADV; the picture here already reaches the cutscene and
+  those knobs change what is rendered, so they stay behind their own flags for
+  a rendering session with screenshots.
+
+### After numbers
+
+Not measured. The single allowed run failed before the title ran, so the
+texture budget, the lifted heap cap and the launcher defaults have **no
+after-measurement** yet. The next run answers all three in one line each:
+`host textures: N (M MB …)` for the budget, `host view heap capped` *absent*
+plus no `title slots past the host heap` line for the cap, and the frame line
+for preparing/copies.

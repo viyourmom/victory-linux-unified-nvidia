@@ -25,6 +25,26 @@ Optional read-only references. Before using anything from them, confirm the repo
 - RAM: 16 GB DDR4 (the main constraint; the title reportedly needs ~24 GB)
 - AMD GPU support cannot be tested here. Treat it as optional and last.
 
+### Where this stands (2026-11-25)
+
+- The combination that reaches the opening cutscene here: **GE-Proton 11-14**
+  (the launcher's default runner) with `VKD3D_CONFIG=nodxr,descriptor_heap`
+  (also the default now). It gets past the exit code 3 older Protons stop at,
+  loads the world and plays the cutscene: 146 draws/frame, 35.2 ms on the
+  GPU. CachyOS 11.0 did not get there.
+- Before numbers, from that run (baseline for the memory work): RSS peak
+  **16,020 MB** on 15,910 MB of RAM; host textures 6,979 MB; frame 1,476.6 ms
+  with **1,028.5 ms preparing**, of which copies of title memory took 1,768
+  ms for 159.9 MB (times overlap across threads), and 0.7 fps.
+- After numbers: **not measured yet.** The one allowed run under the new build
+  never created a Vulkan device and showed a white window (PROGRESS.md, Part
+  3), so nothing was compared.
+- Host texture budget default is now **5,632 MB** (was 6,656), so host
+  textures plus the title's own memory fit under 13.5 GB on this 16 GB box.
+- A view-tree wineserver (`~/.local/share/victory/ge-proton11-14-viewtree`)
+  builds, speaks protocol 938 and is reachable with `--runner proton:...`, but
+  is **not** the default: the run under it failed at device creation.
+
 ## Target stack (what "works" means for late-stage work)
 
 - **vkd3d-proton is the only D3D12 host.** Vulkan 1.3+, portable SPIR-V lowering (no wave-width or AMD-only intrinsic assumptions), `VK_KHR_timeline_semaphore` for fences, `VK_EXT_memory_budget` for the VRAM budget. Anything that only works on one vendor, or only on Windows' own D3D12 runtime, is a bug.

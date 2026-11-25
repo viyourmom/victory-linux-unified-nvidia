@@ -1099,8 +1099,12 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
 }
 
 /// Host texture bytes past which no new host texture is made:
-/// `VICTORY_TEXTURE_BUDGET_MB`, 6,656 MB by default (an 8 GB card's usable
-/// share after the swap chain, the descriptor heaps and the desktop).
+/// `VICTORY_TEXTURE_BUDGET_MB`, 5,632 MB by default: an 8 GB card's usable
+/// share after the swap chain, the descriptor heaps and the desktop, less
+/// what a 16 GB machine has to keep for the title's own memory. The first
+/// world run here reached 6,979 MB of host textures and an RSS peak of
+/// 16,020 MB on 15,910 MB of RAM, and the reclaim it caused showed up as
+/// 159.9 MB of copies taking 1.7 s per frame.
 #[cfg(windows)]
 fn texture_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1108,7 +1112,7 @@ fn texture_budget() -> u64 {
         std::env::var("VICTORY_TEXTURE_BUDGET_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(6656 << 20, |mb| mb << 20)
+            .map_or(5632 << 20, |mb| mb << 20)
     })
 }
 

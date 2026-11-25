@@ -87,6 +87,21 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Whether vkd3d-proton's `descriptor_heap` config is on (it comes in
+/// `VKD3D_CONFIG`, comma or space separated, and is off by default there).
+/// It lifts vkd3d-proton's own 1,000,000-entry cap on shader-visible heaps:
+/// the first Linux boot of the world logged a title heap of 4,194,305 slots
+/// capped to 1,000,000, and the live slots past the cap (highest 1,245,183)
+/// were not mirrored. `scripts/play-linux.sh` sets it by default.
+fn vkd3d_descriptor_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VKD3D_CONFIG")
+            .map(|v| v.replace(',', " "))
+            .is_ok_and(|v| v.split_whitespace().any(|w| w.eq_ignore_ascii_case("descriptor_heap")))
+    })
+}
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -161,18 +176,29 @@ impl HostHeap {
                     // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
                     // faults on an index past them, as before the clamp.
                     let small = count + MIN_DYNAMIC;
+                    // Past the host's limit only some descriptors can be had.
+                    // Without `descriptor_heap` that limit is `PORTABLE_VIEWS`,
+                    // and the dynamic range keeps its room. With it, vkd3d-proton
+                    // takes the title's whole heap, so a refusal here is not the
+                    // cap: keep every title slot (nothing past them is mirrored)
+                    // and give up the dynamic slots, which say so when asked.
+                    let (cap, extra) = if vkd3d_descriptor_heap() {
+                        (count, 0)
+                    } else {
+                        (PORTABLE_VIEWS, MIN_DYNAMIC)
+                    };
                     match make(small) {
                         Ok(heap) => (heap, count, MIN_DYNAMIC, small),
-                        Err(e) if small > PORTABLE_VIEWS => {
-                            // shortcut: descriptors past the host's limit are left
-                            // out; a title that reaches them needs remapping.
-                            tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                            let heap = make(PORTABLE_VIEWS).ok()?;
-                            (heap, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC, PORTABLE_VIEWS)
-                        }
-                        Err(e) => {
+                        Err(e) if small <= cap => {
                             tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                             return None;
+                        }
+                        Err(e) => {
+                            // shortcut: descriptors past the host's limit are left
+                            // out; a title that reaches them needs remapping.
+                            tracing::warn!(error = %e, count, cap, extra, "host view heap capped at {cap}");
+                            let heap = make(cap).ok()?;
+                            (heap, cap - extra, extra, cap)
                         }
                     }
                 }
