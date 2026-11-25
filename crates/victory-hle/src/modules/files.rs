@@ -541,12 +541,40 @@ pub extern "system" fn ReadFile(
     )
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose writes fail on a block we left read-only to see
+/// the title's next write (the guard's handler never runs for them). So the
+/// bytes are read beside, a chunk at a time, and copied in from user mode,
+/// where a guarded block faults into the guard like the title's own writes.
+/// Returns the items read, as the CRT does; the bytes of a partial last item
+/// are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let total = size.saturating_mul(count);
+    if buffer.is_null() || total == 0 {
+        // The CRT's own checks and answer (nothing to read, or EINVAL).
+        return read(buffer, size, count, stream);
+    }
+    // A caller may ask for far more than the file holds: the bytes come
+    // back in chunks, and a short read ends the request.
+    const CHUNK: usize = 1 << 20;
+    let mut beside = vec![0u8; total.min(CHUNK)];
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(CHUNK);
+        let n = read(beside.as_mut_ptr(), 1, want, stream);
+        if n > 0 {
+            // SAFETY: the caller's buffer holds `size * count` bytes, and
+            // `done + n` is at most that; the guard is held across the copy.
+            let _writing = victory_gpu::kernel_will_write(buffer as usize + done, n);
+            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            done += n;
+        }
+        if n < want {
+            break;
+        }
+    }
+    done / size
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {

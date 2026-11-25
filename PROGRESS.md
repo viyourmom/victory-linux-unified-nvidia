@@ -18,7 +18,8 @@ checking and testing, never for running a title.
 | `b41d337` | Phase 1: `PROGRESS.md` records the first boot attempt and what its logs prove. |
 | `a1aeebf` | Runtime invariants in `CLAUDE.md`: series-x is the target, the 1,000,000-slot host heap, 16 GB/8 GB discipline, portable Vulkan + NTSYNC, and the evidence loop. |
 | `6ffc235` | The descriptor loop counts instead of logging per slot, staging buffers are capped at 1 GiB, and host textures stop at the card's budget instead of killing the driver. |
-| _this commit_ | `PROGRESS.md`: what the series-x run does now, measured, and the one blocker left. |
+| `7c5e877` | `PROGRESS.md`: what the series-x run does now, measured, and the one blocker left. |
+| _this commit_ | Trexies' fork evaluated commit by commit, host-copy refreshes run on several threads (`VICTORY_WIDE_REFRESH`), `fread` reads beside the title's buffer, and `VICTORY_MEM_STATS=1` reports RSS/commit and the card's budget. |
 
 ## Phase 0 — audit (done)
 
@@ -161,3 +162,121 @@ Still open, in the order the evidence puts them:
   driver quirk.
 - **series-s** was not run (stalls before the first present, per the
   invariants).
+
+## Trexies' fork (`trexies/VIwork`) — evaluated, two changes ported
+
+Fetched into the temporary remote `trexies` (branch `VIwork`): **90 commits**
+on top of `ffe310e` (upstream main), **45,377 lines** across 101 files, while
+this tree carries 329 commits since that base. The fork's lineage is
+upstream-plus-its-own-work; this tree is the allforks lineage, so the same
+files have been rewritten twice, differently.
+
+### What it adds
+
+- **Submission/memory architecture (the bulk of the diff).** Flights of
+  submissions sent ahead of their wait (`VICTORY_RELAY`, `VICTORY_LATE_WAIT`),
+  copies that settle run on the card (`VICTORY_GPU_BUFFER_COPY`,
+  `VICTORY_FILL_ON_CARD`), title buffers folded into their windows
+  (`VICTORY_FOLD_BUFFERS`), an indirect-draw budget in card memory with the
+  clamp charging once per group, card fetches on a second copy queue, and a
+  parallel wide merge. Its own numbers on an RTX 4070: 179 -> 160 ms/frame
+  (fold), 159 -> ~121 ms/frame (indirect windows).
+- **Shader recompiler.** Clean-up passes over the finished module
+  (`VICTORY_SHADER_OPT`: dead code, folding, reuse, branch facts), a census,
+  ~43 % fewer host instructions and ~20 ms/frame less GPU time on its machine;
+  plus title-specific lowering fixes (fog reconstruction, shadow mask, hair,
+  blend-shape skinning, immediate samplers, `v_cvt_f32_f64`, ISG1 usage after
+  the opt pass), 5,198 lines added to `emit/lower.rs`.
+- **Ray tracing.** Emulated ray/box and ray/triangle tests in DXIL, structure
+  builders translate, `VICTORY_RT_OFF` drops the RT pipelines by name.
+- **HLE.** `fread`/`ReadFile` that read beside a guarded title buffer, page
+  arrays read when a storage request runs, mouse-look (capture, raw motion).
+- **Diagnostics.** `victory warm`, program census, more captures.
+
+### Why nothing could be cherry-picked
+
+Each of the 90 commits was applied to this tree with `git apply --3way` in a
+linked worktree and the conflict markers counted. **Three applied cleanly**:
+`0f78833` (`.bat` line endings), `c255005` (a GPU benchmark test only) and
+`e6d37be` (title buffer copies on the card, which needs the flights
+architecture this tree does not have). Everything else conflicts, because
+the fork's `host.rs` (+6,479 lines), `shadow.rs` (+3,439), `descriptor/host.rs`
+(+2,257) and `emit/lower.rs` (+5,198) are rewrites of files this tree also
+rewrote. Rule 4 (no speculative cross-crate rewrites) rules out resolving
+thousands of conflict hunks by hand.
+
+### What was ported
+
+1. **Host-copy refreshes on several threads** (`crates/victory-gpu/src/host.rs`).
+   `Batch::flush` brought up to ~80 copies per submission one after another
+   on the submitting thread, each asking the kernel which pages the title
+   wrote (`GetWriteWatch`, a page-table walk) and copying them. The copies are
+   independent mappings (`Shadow` is already `Send + Sync`, each tracks its
+   own pages), so they now go to a thread each: `VICTORY_WIDE_REFRESH=0`
+   disables it, `=1` forces it, unset means on where the host has four or more
+   logical CPUs. The range bookkeeping (`current`, the counters) stays on the
+   submitting thread and in the recorded order. *(fork 787a4a8, same switch
+   name and defaults.)*
+2. **`fread` reads beside the title's buffer** (`crates/victory-hle/src/modules/files.rs`).
+   The CRT read large requests straight into the caller's buffer through the
+   kernel, whose writes fail on a block we left read-only to see the title's
+   next write (the guard's handler never runs for them). Bytes now come back
+   in 1 MiB chunks into a side buffer and are copied in from user mode, where
+   a guarded block faults into the guard like the title's own writes. This is
+   in the RPF streaming path, where the run spends its world load.
+   *(fork 5c17a72, ported onto this tree's `KernelWrite` guard, which must be
+   held across the copy.)*
+3. **`VICTORY_MEM_STATS=1`** (default off). One `memory:` line per frame-rate
+   line: RSS and peak, commit and peak (`K32GetProcessMemoryInfo`). It also
+   asks `IDXGIAdapter3::QueryVideoMemoryInfo` for the card's budget; under
+   vkd3d-proton the D3D12 device is **not** an `IDXGIDevice`, so the query
+   reports that once and stops (see the run below). Reporting only — no
+   budget here changes what is allocated.
+
+### What was rejected, and why
+
+| Fork work | Why not ported |
+| --- | --- |
+| Flights/relay/card copies/fold buffers/indirect budget (the 121–160 ms/frame work) | Needs the rewritten `shadow.rs`/`host.rs`/`indirect.rs`; conflicts in every file it touches. A port is a re-architecture, not a fix. |
+| `VICTORY_SHADER_OPT` clean-up passes (~43 % fewer host instructions) | 2,136 new lines plus conflicts in `lower.rs`, `mod.rs`, `shader.rs`, `bitcode.rs`, and it changes the shader-cache key (every program retranslates). Highest-value item left; needs its own phase with a warm-cache measurement. |
+| Ray tracing, `VICTORY_RT_OFF` | This tree's default is `VKD3D_CONFIG=nodxr`; RT is a rendering feature, not speed or RSS. |
+| Texture eviction by reverse index, sparse descriptor remapping | The fork has no such thing either. Its `VICTORY_TEXTURE_ROOM_PERCENT` is the same budget wall this tree already has in `VICTORY_TEXTURE_BUDGET_MB`. |
+| Case-insensitive path cache in `modules::files` | Not in the fork; a new feature with its own invalidation rules. Not started. |
+| Wave64 (`VICTORY_WAVE_WIDE`, `VICTORY_HOST_MAX_WAVE`) | AMD-targeted and the fork's own README says its 64-lane barrier form lost the card until made opt-in. Out of scope per the invariants. |
+
+Already present here, so nothing to port: copy-back comparing 64 KiB pieces
+with one scratch buffer per submission, `ReadProcessMemory` copies instead of
+`VirtualQuery`-then-`memcpy`, and the descriptor clamp past the host heap.
+
+### Measured (one bounded run per arm, 75 s, diagnostics build)
+
+The Enter script (`VICTORY_KEYS=25:Enter,35:Enter,50:Enter`) is required to
+leave the menu. Both arms below ran the same build and script; only
+`VICTORY_WIDE_REFRESH` differed.
+
+| Arm | copies (ms/frame) | preparing (ms/frame) | RSS | What the run did |
+| --- | --- | --- | --- | --- |
+| off (`=0`) | 0.0, 0.0, 0.6, 2.4, 6.7, 15.3, 14.0, 2.5 | 0.7 → 34.4 | 6.5 GB → 13.6 GB | menu, one load-start blip, back to menu (30 fps) |
+| on (default) | 0.0, 0.2, 0.2, 0.0, 0.2 | 0.5 → 1.5 | 3.0 → 3.6 GB | menu, then world load from 13:39:51, silent stop 13:40:20 |
+
+Honest reading: **the two arms did different work**, so this is indicative,
+not a controlled measurement. The serial arm's 15 ms copy bucket came from the
+texture-computer stretch; with threads on, the same stretch's buckets read
+0.2 ms, and no bucket got worse. A world frame (the fork's 45–50 ms serial
+case) is still unreachable here, so the win in the world is **UNVERIFIED** on
+this machine; the menu is too light to show it.
+
+`VICTORY_MEM_STATS=1` output from the run: `memory: RSS 2992 MB (peak 2992 MB),
+commit 1704 MB (peak 1704 MB)`, then `vram: the device is not an IDXGIDevice;
+no video memory budget` — vkd3d-proton's device does not reach a DXGI adapter,
+so VRAM has to be read from the host (`nvidia-smi`), not from the runtime.
+
+Also measured: a void run in between (13:37) in which vkd3d-proton failed to
+create the Vulkan device (`vr -3`) because the previous `kill -9`'d run had
+not finished releasing the GPU. Its log says `no host D3D12 device` and no
+frames ran; it is not part of the comparison. Space consecutive runs further
+apart, or wait for `wineserver` to exit.
+
+The world load still stops silently at 13:40:20 (texture computer starts,
+resource allocations, then no line: no panic, no Xid, no NVRM, no OOM entry),
+the same failure as the 13:16 run. Nothing here claims to fix it.

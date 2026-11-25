@@ -88,6 +88,81 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Live memory of the run, once per frame-rate line when
+/// `VICTORY_MEM_STATS=1` (default off): the process's resident and committed
+/// bytes, and the card's budget and use.
+///
+/// The card's numbers come from `IDXGIAdapter3::QueryVideoMemoryInfo`,
+/// which vkd3d-proton answers from `VK_EXT_memory_budget`; a host without
+/// that extension fails the call, which is reported once and then not
+/// asked again. Reporting only: no budget here changes what is allocated.
+fn memory_stats() {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    // SAFETY: a plain query of this process's own memory counters.
+    let read = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    } != 0;
+    let mb = |bytes: usize| bytes as f64 / 1e6;
+    if read {
+        tracing::info!(
+            "memory: RSS {:.0} MB (peak {:.0} MB), commit {:.0} MB (peak {:.0} MB)",
+            mb(counters.WorkingSetSize),
+            mb(counters.PeakWorkingSetSize),
+            mb(counters.PagefileUsage),
+            mb(counters.PeakPagefileUsage),
+        );
+    }
+    static NO_BUDGET: std::sync::Once = std::sync::Once::new();
+    // SAFETY: plain DXGI interface queries on a live device.
+    let Some(dxgi) = host().and_then(|h| unsafe { h.device.cast::<IDXGIDevice>().ok() }) else {
+        NO_BUDGET.call_once(|| {
+            tracing::info!("vram: the device is not an IDXGIDevice; no video memory budget")
+        });
+        return;
+    };
+    // SAFETY: as above.
+    let Some(adapter) = (unsafe { dxgi.GetAdapter().ok() }) else {
+        NO_BUDGET.call_once(|| {
+            tracing::info!("vram: the device reaches no DXGI adapter; no video memory budget")
+        });
+        return;
+    };
+    let Ok(adapter) = adapter.cast::<IDXGIAdapter3>() else {
+        NO_BUDGET.call_once(|| {
+            tracing::info!(
+                "vram: the host's DXGI adapter is not an IDXGIAdapter3; no video memory budget"
+            )
+        });
+        return;
+    };
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a plain query of the local segment's budget.
+    let asked = unsafe {
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+    };
+    match asked {
+        Ok(()) => tracing::info!(
+            "vram: budget {:.0} MB, in use {:.0} MB, available {:.0} MB; host textures {:.0} MB, staging {:.0} MB",
+            mb(info.Budget as usize),
+            mb(info.CurrentUsage as usize),
+            mb(info.AvailableForReservation as usize),
+            crate::resource::texture_counts().1 as f64 / 1e6,
+            crate::texture::staging_bytes() as f64 / 1e6,
+        ),
+        Err(e) => NO_BUDGET.call_once(|| {
+            tracing::info!(error = %e, "vram: the host does not report a video memory budget")
+        }),
+    }
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -1940,15 +2015,20 @@ impl Batch {
     }
 
     /// Does the refreshes; returns the bytes copied.
+    ///
+    /// A copy's refresh asks the kernel which of its pages the title wrote
+    /// (a walk of the page tables, then the copy) and nothing orders one
+    /// copy before another, so on a host with threads they run there
+    /// ([`wide_refresh`]). The bookkeeping stays on the submitting thread,
+    /// in the order the ranges were recorded.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let done = refresh_copies(&refreshes);
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+        for ((shadow, from, to), (copied, us)) in refreshes.into_iter().zip(done) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -1966,6 +2046,92 @@ impl Batch {
         }
         total
     }
+}
+
+/// The most threads a submission's refreshes are spread over (one per
+/// logical CPU below this, and never more than there are copies).
+const REFRESH_THREADS: usize = 8;
+
+/// Whether a submission's refreshes of host copies run on several threads,
+/// a copy to a thread (`VICTORY_WIDE_REFRESH=1` forces it, `=0` disables
+/// it; otherwise it is on where the host has four logical CPUs or more).
+///
+/// A world submission brings some eighty copies up to date, one after
+/// another on the submitting thread: each asks the kernel which pages the
+/// title wrote since it was taken (`GetWriteWatch` walks the page tables)
+/// and copies those pages. The copies are independent mappings, so the asks
+/// and the copies of different copies are independent too.
+fn wide_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        wide_refresh_enabled(
+            std::env::var("VICTORY_WIDE_REFRESH").ok().as_deref(),
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+        )
+    })
+}
+
+/// [`wide_refresh`]'s decision; pure, for testing.
+fn wide_refresh_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
+#[cfg(test)]
+mod wide_refresh_tests {
+    use super::wide_refresh_enabled;
+
+    /// On by default where there are threads to use it on, off where there
+    /// are not, and either way when asked.
+    #[test]
+    fn parallel_refresh_is_default_on_multicore_and_can_be_overridden() {
+        assert!(wide_refresh_enabled(None, Some(4)));
+        assert!(wide_refresh_enabled(None, Some(16)));
+        assert!(!wide_refresh_enabled(None, Some(2)));
+        assert!(!wide_refresh_enabled(None, None));
+        assert!(wide_refresh_enabled(Some("1"), Some(1)));
+        assert!(!wide_refresh_enabled(Some("0"), Some(16)));
+        assert!(wide_refresh_enabled(Some("auto"), Some(4)));
+    }
+}
+
+/// A submission's refreshes, each done once: `(bytes copied, microseconds)`
+/// per range, in the order the ranges were recorded ([`wide_refresh`]
+/// decides between one thread and several).
+fn refresh_copies(
+    refreshes: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+) -> Vec<(usize, u64)> {
+    let n = refreshes.len();
+    let one = |i: usize| {
+        let (shadow, from, to) = &refreshes[i];
+        let started = Instant::now();
+        let copied = shadow.update(*from, to - from);
+        (copied, started.elapsed().as_micros() as u64)
+    };
+    let threads = if wide_refresh() { REFRESH_THREADS.min(n) } else { 1 };
+    if threads <= 1 {
+        return (0..n).map(one).collect();
+    }
+    let done: Mutex<Vec<Option<(usize, u64)>>> = Mutex::new(vec![None; n]);
+    std::thread::scope(|scope| {
+        for first in 0..threads {
+            let (done, one) = (&done, &one);
+            scope.spawn(move || {
+                for i in (first..n).step_by(threads) {
+                    let result = one(i);
+                    done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(result);
+                }
+            });
+        }
+    });
+    done.into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect()
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -2386,6 +2552,9 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if crate::switch::on("VICTORY_MEM_STATS") {
+                memory_stats();
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \

@@ -46,6 +46,23 @@ options:
 Nothing is optimised by default: VICTORY_RELAY, VICTORY_LATE_WAIT,
 VICTORY_WIDE_BACK and VICTORY_PIPELINE_WAIT_MS are left unset here, to be
 turned on one at a time (and measured) in Phase 4.
+
+Switches this script knows about, all read by the runtime itself:
+  VICTORY_MEM_STATS=1          one line per frame-rate line (every 5 s) with
+                               the process's RSS and commit, the card's
+                               budget/use (vkd3d-proton's VK_EXT_memory_budget)
+                               and the host textures and staging buffers.
+                               Reporting only; off by default.
+  VICTORY_TEXTURE_BUDGET_MB    how much host texture memory to reach before
+                               new textures are refused (default 6656, an
+                               8 GB card's usable share).
+  VICTORY_STAGING_MB           the cap on upload staging buffers (default
+                               1024); the oldest is given back first.
+  VICTORY_WIDE_REFRESH=0|1     host copies refreshed on several threads (on
+                               by default where the host has 4+ logical
+                               CPUs); =1 forces it, =0 disables it.
+  VICTORY_KEYS=<sec>:<key>,... scripted pad/key presses (diagnostics build):
+                               VICTORY_KEYS=25:Enter leaves the menu.
 EOF
 }
 
