@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod abort;
 mod census;
 mod inspect;
 // The warm-up and the batch translator make host shaders and pipelines on
@@ -143,6 +144,9 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Before anything that can abort: a CRT abort ends the process at exit
+    // code 3 with no exception handler and no line (see `abort`).
+    abort::install();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

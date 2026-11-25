@@ -400,3 +400,58 @@ Next, in order: find where those two programs get wave 64 (finish the wave
 diagnostic, then either port soldsawn's paired form or relax the requirement
 behind a `VICTORY_*` switch); if that is not it, dump the title's own state
 at the stop with `VICTORY_DUMPS`-style tables on the last frame.
+
+## JMAN730 and the wave-size question (2026-11-25, second pass)
+
+`JMAN730/victory` is reachable and large: **113 branches**, `main` 780 commits
+ahead of `ffe310e`. Its `docs/linux-proton.md` is a full Linux guide (Nix
+shell, `cargo xwin`, umu-run, Proton) and `docs/arch-proton-rendering.md` is a
+**CachyOS + RTX 4080** report that describes our failure exactly:
+
+> During the transition to the world, two compute pipelines were refused. The
+> Linux kernel then logged NVIDIA Xid 13 (GPU MMU fault) for the title
+> process, and VIctory recorded a null write (`0xc0000005`) in `crashes.log`.
+
+Our 13:40 crash report is the same null write, and the same two refusals
+appear in every run since. Their `docs/research/wave-size-rules.md` (215
+lines, primary sources) settles the mechanism: `[WaveSize(N)]` is entry
+property tag 11 in DXIL and `MinimumExpectedWaveLaneCount`/
+`MaximumExpectedWaveLaneCount` in `PSV0`; the **runtime** rejects a pipeline
+state whose declared size does not satisfy `WaveLaneCountMin <= N <=
+WaveLaneCountMax`; NVIDIA reports 32/32 in all 509 community reports, AMD
+RDNA 32/64, so a `WaveSize(64)` compute program can only ever load on AMD.
+That is not a driver bug to work around at the pipeline call — the program has
+to stop declaring 64, which means running its 64 lanes on 32-lane hardware.
+
+Their branches for that (`fix/wave64-lane-mask-pair`, 332 lines in 10 files;
+`codex/wave64-indexed-lane-reads`, 286 lines; `shaders/whole-wave-sections`)
+are focused but each sits on their own rewritten `lower.rs` (2,252 lines
+changed from our base) and none applies to ours: `git apply --3way` conflicts
+in every one. soldsawn's `26600c6` is the same idea at full size (`lower.rs`
+1,863 lines changed plus 6 new modules and 1,164 lines of new tests).
+
+**Conclusion: paired wave64 is a project, not a port.** It needs the
+translator's lane model changed (two console lanes per host thread, lane
+masks kept as a pair, `v_cndmask`/`vcc_hi`/DPP handled together), its tests,
+and a cache-key bump. Doing it by hand in this tree without the test suite is
+the kind of rewrite the project's rules forbid. It is the single highest-value
+piece of work left, and it should be its own phase with CGBJ's/JMAN's tests as
+the reference.
+
+### Abort visibility (ported, and what it proved)
+
+`apps/victory/src/abort.rs` now installs a panic hook that writes the payload,
+location, thread and `Backtrace::force_capture()` to `VICTORY_LOG_FILE` with
+`flush()` + `sync_all()`, and a CRT `SIGABRT` handler that does the same and
+exits 3 (the status the CRT uses). `victory-core`'s log writer now flushes
+inside every `write`, so no line is lost when a run ends without unwinding.
+
+The one 120 s run after that still ended at **exit 3 with no panic, no
+`SIGABRT`, no `crashes.log` and no line from our HLE exit paths**. Since a
+statically linked CRT in a title DLL keeps its own `signal` table, an `abort`
+inside such a DLL is still invisible to us — that, or the driver runtime
+ending the process after the GPU fault, is what is left. Neither is provable
+from inside the PE; the next step is to correlate a run with
+`journalctl -k -g 'NVRM: Xid'` (this machine's journal had no Xid line for our
+runs, unlike JMAN's report) and with `winedbg`/`WINEDEBUG=+seh` around the
+last frame.

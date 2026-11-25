@@ -70,11 +70,16 @@ fn writer() -> BoxMakeWriter {
 struct SharedFile(Arc<Mutex<std::fs::File>>);
 
 impl std::io::Write for SharedFile {
+    /// Writes and flushes while holding the lock: a run that ends by `abort`
+    /// (exit code 3) runs no destructor and no handler that could flush, so
+    /// the last line before it has to be on disk already. A line of the log
+    /// is worth one `fsync`-free flush; the file is opened with the OS's
+    /// caching, so this is a write syscall either way.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write(buf)
+        let mut file = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let written = file.write(buf)?;
+        file.flush()?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
