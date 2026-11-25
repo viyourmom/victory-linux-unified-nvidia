@@ -11,8 +11,9 @@ checking and testing, never for running a title.
 | --------- | ----------- |
 | `2458e38` | Phase 0: `AUDIT.md` — three-tree topology, per-crate divergence, real build/test results, structural memory map. No source change. |
 | `959e971` | Phase 1: workspace compiles and tests on Linux; `scripts/build-linux.sh` cross-builds the Windows PE with cargo-xwin. |
-| a26f6c1   | Phase 1: `scripts/play-linux.sh` — runner detection, vkd3d-proton env, XDG caches and saves. |
-| _this commit_ | Phase 1: `docs/linux-baseline.md` — commands, measurement tables and the env matrix for boot failures. |
+| `a26f6c1` | Phase 1: `scripts/play-linux.sh` — runner detection, vkd3d-proton env, XDG caches and saves. |
+| `0b208da` | Phase 1: `docs/linux-baseline.md` — commands, measurement tables and the env matrix for boot failures. |
+| _this commit_ | Phase 1: `play-linux.sh` fixups before the first boot — release build by default, one prefix per runner, `Z:` title paths, directories made before exec. |
 
 ## Phase 0 — audit (done)
 
@@ -42,6 +43,19 @@ Done:
   `$XDG_DATA_HOME/victory`; takes `--console series-x|series-s` and passes
   title arguments through; `--dry-run` prints the command with the game path
   as `$VICTORY_GAME_DIR`. No `VICTORY_*` tuning flag is set by default.
+- Fixups after re-reading the script against what the first boot will need:
+  the runtime defaults to the **release** build that `build-linux.sh` writes
+  (`--profile debug` picks the debug one; `--debug` stays what it says, log
+  verbosity), and a missing `.exe` is a clear failure rather than a Wine
+  message. Each runner gets its own prefix
+  (`$XDG_DATA_HOME/victory/prefix/{proton,umu,wine}`) instead of three layers
+  sharing registry and DLL state. `mkdir -p` runs for the prefix, the vkd3d
+  shader cache, both XDG roots and `PROTON_LOG_DIR` before `exec`, because
+  `proton run` will not create a compatdata folder itself. The title path is
+  handed over as a Windows path (`/x/y` → `Z:\x\y`, a path already naming a
+  drive passes through), and `--debug` now sets
+  `WINEDEBUG=err+all,warn+loaddll` so loader and DLL errors are visible;
+  `PROTON_LOG`/`PROTON_LOG_DIR` are limited to proton and umu-run.
 - `docs/linux-baseline.md`: the commands and the empty tables for frame time,
   RSS, swap, VRAM and shader warm-up, plus the env matrix for boot failures.
 

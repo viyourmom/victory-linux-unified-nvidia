@@ -9,7 +9,11 @@
 #
 # The runtime is a Windows program (AUDIT.md, item 6), so it runs under a
 # compatibility layer even on Linux. Caches go to $XDG_CACHE_HOME/victory
-# (disposable), what titles save goes to $XDG_DATA_HOME/victory (keep it).
+# (disposable), what titles save goes to $XDG_DATA_HOME/victory (keep it);
+# each runner gets its own Wine prefix under .../victory/prefix/<runner>.
+#
+# The title's path is handed to the runtime as a Windows path (Z:\...), since
+# the runtime opens it with the Windows API; Wine maps all of / at Z:.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,9 +32,12 @@ options:
   --runner <name>     proton[:PATH] | umu-run | wine (default: auto — the
                       Proton in a Steam compatibilitytools.d first, with
                       Proton-CachyOS preferred, then umu-run, then Wine)
-  --runtime <path>    the built runtime (default: the release build, else the
-                      debug one that --debug of build-linux.sh leaves)
-  --debug             VKD3D_DEBUG=warn, VICTORY_LOG=debug, PROTON_LOG=1
+  --profile <name>    release (default) or debug: which build under
+                      target/x86_64-pc-windows-msvc to run
+  --runtime <path>    the runtime itself, overriding --profile
+  --debug             verbose, not a build profile: VKD3D_DEBUG=warn,
+                      VICTORY_LOG=debug, WINEDEBUG=err+all,warn+loaddll,
+                      PROTON_LOG=1
   --dry-run           print the environment and the command, run nothing
   --list              list the compatibility layers found, then exit
   -h, --help          this text
@@ -48,6 +55,7 @@ console=series-x
 runner=auto
 exe=
 runtime=
+profile=release
 title_args=()
 
 while [ $# -gt 0 ]; do
@@ -61,6 +69,8 @@ while [ $# -gt 0 ]; do
     --runner=*) runner=${1#*=} ;;
     --exe) exe=${2:?--exe needs a path}; shift ;;
     --exe=*) exe=${1#*=} ;;
+    --profile) profile=${2:?--profile needs release or debug}; shift ;;
+    --profile=*) profile=${1#*=} ;;
     --runtime) runtime=${2:?--runtime needs a path}; shift ;;
     --runtime=*) runtime=${1#*=} ;;
     -h | --help)
@@ -84,6 +94,14 @@ case $console in
 series-x | series-s) ;;
 *)
     echo "play-linux.sh: --console takes series-x or series-s, not '$console'" >&2
+    exit 2
+    ;;
+esac
+
+case $profile in
+release | debug) ;;
+*)
+    echo "play-linux.sh: --profile takes release or debug, not '$profile'" >&2
     exit 2
     ;;
 esac
@@ -281,24 +299,46 @@ case $exe in
 esac
 exe_name=$(basename "$title_exe")
 
+# The runtime is a Windows program and opens the title with the Windows API,
+# so it needs a Windows path; Wine maps the whole filesystem at Z:, making
+# /home/me/game/x.exe into Z:\home\me\game\x.exe. A path that already names a
+# drive (C:\..., e.g. a victory.toml written on Windows) is passed through
+# with its separators normalised. Spaces need no escaping here: the argument
+# travels as one array element, not through a shell string.
+to_winpath() {
+    local p=$1
+    case $p in
+    [A-Za-z]:\\* | [A-Za-z]:/*) printf '%s\n' "${p//\//\\}" ;;
+    *) printf 'Z:%s\n' "${p//\//\\}" ;;
+    esac
+}
+title_win=$(to_winpath "$title_exe")
+posix_exe=0
+case $title_exe in
+[A-Za-z]:*) ;;
+*) posix_exe=1 ;;
+esac
+
+# scripts/build-linux.sh writes target/<target>/<profile>/victory.exe and
+# defaults to --release, so the release build is what runs unless a debug
+# profile is asked for explicitly: it is slower and exists for tracing.
 if [ -z "$runtime" ]; then
-    for candidate in \
-        "target/x86_64-pc-windows-msvc/release/victory.exe" \
-        "target/x86_64-pc-windows-msvc/debug/victory.exe"; do
-        [ -f "$candidate" ] && runtime=$candidate && break
-    done
-    runtime=${runtime:-target/x86_64-pc-windows-msvc/release/victory.exe}
+    runtime=${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-msvc/$profile/victory.exe
 fi
 
 if [ "$dry_run" -eq 0 ]; then
     [ -f "$runtime" ] || {
-        echo "play-linux.sh: no runtime at $runtime — run scripts/build-linux.sh first" >&2
+        echo "play-linux.sh: no runtime at $runtime" >&2
+        echo "  build it with scripts/build-linux.sh (--debug needs --profile debug)" >&2
         exit 1
     }
-    [ -f "$title_exe" ] || {
-        echo "play-linux.sh: the executable named by --exe does not exist" >&2
-        exit 1
-    }
+    # A drive-letter path is not something this Linux side can stat.
+    if [ "$posix_exe" -eq 1 ]; then
+        [ -f "$title_exe" ] || {
+            echo "play-linux.sh: the executable named by --exe does not exist" >&2
+            exit 1
+        }
+    fi
 fi
 
 # --- the environment ------------------------------------------------------
@@ -320,7 +360,17 @@ fi
 
 cache_root=${VICTORY_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/victory}
 data_root=${VICTORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/victory}
-prefix=$data_root/prefix
+
+# One prefix per runner. A Wine prefix carries registry and DLL state that
+# only the layer which prepared it understands: a prefix Proton has set up is
+# not something plain Wine should be pointed at, and umu-run keeps its own.
+case $runner_kind in
+proton) prefix_kind=proton ;;
+umu-run) prefix_kind=umu ;;
+wine) prefix_kind=wine ;;
+esac
+prefix=$data_root/prefix/$prefix_kind
+prefix_shown="\$XDG_DATA_HOME/victory/prefix/$prefix_kind"
 
 names=()
 values=()
@@ -342,20 +392,34 @@ set_default VICTORY_CACHE_DIR "$cache_root" '$XDG_CACHE_HOME/victory'
 set_default VICTORY_DATA_DIR "$data_root" '$XDG_DATA_HOME/victory'
 set_default VKD3D_CONFIG "dxr,dxr11" 'dxr,dxr11'
 set_default VKD3D_SHADER_CACHE_PATH "$cache_root/vkd3d" '$XDG_CACHE_HOME/victory/vkd3d'
-set_default WINEDEBUG "-all" '-all'
+# -all mutes Wine's fixme spam, which otherwise buries vkd3d and our lines; a
+# debug run wants the opposite — the loader and DLL errors that explain a
+# failed boot.
+if [ "$use_debug" -eq 1 ]; then
+    winedebug=err+all,warn+loaddll
+else
+    winedebug=-all
+fi
+set_default WINEDEBUG "$winedebug" "$winedebug"
 set_default VICTORY_LOG "$([ "$use_debug" -eq 1 ] && echo debug || echo info)" \
     "$([ "$use_debug" -eq 1 ] && echo debug || echo info)"
 if [ "$use_debug" -eq 1 ]; then
     set_default VKD3D_DEBUG warn warn
-    set_default PROTON_LOG 1 1
-    set_default PROTON_LOG_DIR "$cache_root/proton" '$XDG_CACHE_HOME/victory/proton'
+    # PROTON_LOG is Proton's own switch; plain Wine has no such variable and
+    # would only carry a stray entry.
+    case $runner_kind in
+    proton | umu-run)
+        set_default PROTON_LOG 1 1
+        set_default PROTON_LOG_DIR "$cache_root/proton" '$XDG_CACHE_HOME/victory/proton'
+        ;;
+    esac
 fi
 
 case $runner_kind in
 proton)
     # Proton needs a prefix (its own STEAM_COMPAT_DATA_PATH, not WINEPREFIX)
     # and a Steam client directory to borrow the runtime from.
-    set_default STEAM_COMPAT_DATA_PATH "$prefix" '$XDG_DATA_HOME/victory/prefix'
+    set_default STEAM_COMPAT_DATA_PATH "$prefix" "$prefix_shown"
     set_default STEAM_COMPAT_CLIENT_INSTALL_PATH "$(steam_client)" "$(steam_client)"
     ;;
 umu-run)
@@ -364,17 +428,17 @@ umu-run)
     if [ -z "${PROTONPATH:-}" ] && proton=$(pick_proton); then
         set_default PROTONPATH "$proton" "$proton"
     fi
-    set_default WINEPREFIX "$prefix" '$XDG_DATA_HOME/victory/prefix'
+    set_default WINEPREFIX "$prefix" "$prefix_shown"
     set_default GAMEID 0 0
     ;;
 wine)
-    set_default WINEPREFIX "$prefix" '$XDG_DATA_HOME/victory/prefix'
+    set_default WINEPREFIX "$prefix" "$prefix_shown"
     ;;
 esac
 
 # --- the command ----------------------------------------------------------
 
-runtime_args=(run "$title_exe" --console "$console" --execute)
+runtime_args=(run "$title_win" --console "$console" --execute)
 runtime_shown=(run "\$VICTORY_GAME_DIR/$exe_name" --console "$console" --execute)
 if [ ${#title_args[@]} -gt 0 ]; then
     runtime_args+=(-- "${title_args[@]}")
@@ -414,9 +478,27 @@ if [ "$dry_run" -eq 1 ]; then
     exit 0
 fi
 
-# The caches and the prefix are ours to make; victory.toml paths are the
-# runtime's to make (it checks them against the asset policy itself).
-mkdir -p "$cache_root" "$data_root" "$prefix"
+# `proton run` refuses a STEAM_COMPAT_DATA_PATH that does not exist, and
+# vkd3d-proton makes its shader cache only under an existing parent, so every
+# directory this script hands over is created first. The title's own folders
+# stay untouched: victory.toml paths are the runtime's to check.
+directories=("$cache_root" "$data_root" "$prefix")
+dir_value() {
+    local want=$1 i
+    for i in "${!names[@]}"; do
+        if [ "${names[$i]}" = "$want" ]; then
+            printf '%s\n' "${values[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+for dir_name in VICTORY_CACHE_DIR VICTORY_DATA_DIR VKD3D_SHADER_CACHE_PATH PROTON_LOG_DIR; do
+    if dir=$(dir_value "$dir_name"); then
+        directories+=("$dir")
+    fi
+done
+mkdir -p "${directories[@]}"
 
 for i in "${!names[@]}"; do
     export "${names[$i]}=${values[$i]}"
