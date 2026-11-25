@@ -21,7 +21,8 @@ loads the world and shows it: slowly, and with rendering defects.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT. On Linux (Proton +
+vkd3d-proton) it is further behind: see [Linux](#linux-proton-umu-run-wine).
 
 > **Warning.** Entering the world on a real GPU has hung it in earlier
 > builds, and Windows then resets the display driver (every monitor goes
@@ -119,6 +120,48 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+## Linux (Proton, umu-run, Wine)
+
+The runtime is a Windows PE, so Linux runs it as one, under Proton's Wine and
+vkd3d-proton. Two scripts do it and neither one touches your game folder.
+
+Requirements: Rust, `cargo-xwin` for the cross build, and a Proton with a
+dxil-spirv from GE-Proton 11-13 or newer (`GE-Proton11-14-x86_64` is what is
+tested here). `scripts/play-linux.sh` looks in `compatibilitytools.d`, then
+falls back to `umu-run`, then to plain `wine`.
+
+```bash
+cargo install cargo-xwin --locked            # once
+scripts/build-linux.sh                       # writes target/x86_64-pc-windows-msvc/release/victory.exe
+scripts/play-linux.sh --exe <the title's exe> --console series-x
+```
+
+`play-linux.sh` sets `VKD3D_CONFIG`, `PROTON_USE_NTSYNC=1`, `WINEDEBUG` and the
+runtime's own paths; keeps caches under `$XDG_CACHE_HOME/victory` and saves
+under `$XDG_DATA_HOME/victory`; gives each runner its own Wine prefix; and
+writes the runtime's log to `$XDG_CACHE_HOME/victory/victory.log` with
+`--debug` (a PE's stdio is not the launching terminal under `proton run`). It
+takes `--runner proton[:PATH] | umu-run | wine`, `--profile release|debug`,
+`--runtime <path>`, `--console series-x|series-s`, `--dry-run` and `--list`.
+An inherited `VKD3D_CONFIG` wins over its defaults.
+
+State on the test machine (CachyOS, RTX 3070 8 GB, Ryzen 7 3700X, 16 GB): the
+Vulkan device is created and frames present at 30 fps; a run reaches the world
+load, creates mesh pipelines, and gets into the opening cutscene with working
+audio. The picture is **black** and the run ends silently after about two
+minutes. `PROGRESS.md` has the numbers and what is still open.
+
+Linux-side switches (all off by default unless stated):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `VKD3D_CONFIG` | `nodxr,descriptor_heap` | DXR off, the descriptor-heap path on |
+| `VICTORY_TEXTURE_BUDGET_MB` | `5632` | host texture memory before new ones are refused |
+| `VICTORY_STAGING_MB` | `1024` | cap on upload staging buffers |
+| `VICTORY_MEM_STATS=1` | off | RSS, commit, host textures and staging, once per frame-rate line |
+| `VICTORY_WIDE_REFRESH=0\|1` | on with 4+ CPUs | host copies of title memory refreshed on several threads |
+| `VICTORY_LOG_WAVE=1` | off | one line per compute shader that requires a wave size, and why |
 
 ## Commands
 

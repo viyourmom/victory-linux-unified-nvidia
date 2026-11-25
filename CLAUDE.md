@@ -36,9 +36,16 @@ Optional read-only references. Before using anything from them, confirm the repo
   **16,020 MB** on 15,910 MB of RAM; host textures 6,979 MB; frame 1,476.6 ms
   with **1,028.5 ms preparing**, of which copies of title memory took 1,768
   ms for 159.9 MB (times overlap across threads), and 0.7 fps.
-- After numbers: **not measured yet.** The one allowed run under the new build
-  never created a Vulkan device and showed a white window (PROGRESS.md, Part
-  3), so nothing was compared.
+- After numbers, measured on 2026-11-25 after a cold reboot and a clean
+  prefix: the Vulkan device is created again (no `vr -3`), the menu runs at 30
+  fps / 12 draws with host textures 4,518 MB of the 5,632 MB budget and RSS
+  3.6 GB, and a 90 s run reaches frame 2048+ (11,186 draws) and the opening
+  cutscene **with sound**. The picture is **black** and the run still ends
+  silently (~137 s). See PROGRESS.md, "Cold reboot".
+- `descriptor_heap` does **not** lift vkd3d-proton's 1,000,000 cap on this
+  stack: with it on, a heap of 1,245,184 slots is handed out that the host
+  says it cannot make. `VKD3D_CONFIG=nodxr` alone gives the proven clamp
+  (934,464 title slots) and is the configuration to debug rendering with.
 - Host texture budget default is now **5,632 MB** (was 6,656), so host
   textures plus the title's own memory fit under 13.5 GB on this 16 GB box.
 - A view-tree wineserver (`~/.local/share/victory/ge-proton11-14-viewtree`)

@@ -674,7 +674,7 @@ slots, `PORTABLE_VIEWS - MIN_DYNAMIC` = 1,000,000 − 65,536 = **934,464**
 
 ### The one bounded run (150 s) — white window
 
-`VICTORY_MEM_STATS=1 VICTORY_KEYS=… play-linux.sh --exe game_scarlett_master.exe
+`VICTORY_MEM_STATS=1 VICTORY_KEYS=… play-linux.sh --exe <the title's exe>
 --console series-x --debug` (which now picks the view-tree runner): **exit 58
 after ~40 s** and a **white window**. vkd3d-proton never got a device:
 
@@ -727,3 +727,43 @@ after-measurement** yet. The next run answers all three in one line each:
 `host textures: N (M MB …)` for the budget, `host view heap capped` *absent*
 plus no `title slots past the host heap` line for the cap, and the frame line
 for preparing/copies.
+
+## Cold reboot: the device is back, the picture is not (2026-11-25)
+
+After a full cold reboot, the prefix, the vkd3d-proton cache and
+`victory.log` were deleted (the view-tree tree kept), and two bounded runs
+were made with the same release PE, stock `GE-Proton11-14-x86_64`,
+`--console series-x --debug`.
+
+| Run | `VKD3D_CONFIG` | What it did |
+| --- | --- | --- |
+| 1 | `nodxr,descriptor_heap` | `host D3D12 device ready`, **no `vr -3`**; menu at 30 fps, 12 draws/frame, host textures 4,518 MB of the 5,632 MB budget, RSS 3.6 GB/peak 3.6 GB. The window was closed by hand because the picture was black (the entry then returned 58) |
+| 2 | `nodxr` | same device; frame 2048+ and 11,186 draws in one window, **mesh** pipelines created, then the world and the opening cutscene **with sound and a black picture**, ending at ~137 s with no report |
+
+What this settles:
+
+- **`vkd3d_create_vk_device: vr -3` is resolved.** It was stale state from the
+  pre-reboot `kill -9`: a fresh prefix and a cold driver create the device in
+  both configurations, with no extension-removal retry in the log.
+- **`descriptor_heap` does not lift vkd3d-proton's cap** (this contradicts the
+  comment on `vkd3d_descriptor_heap()` in `descriptor/host.rs`). With the flag
+  on, the host still logs `Unsupported descriptor count … (max 1000000)`, and
+  our run reports `host view heap capped at 1245184 … count=1245184 cap=1245184`
+  -- a heap of slots 1,000,000..1,245,184 that the host says it cannot make,
+  which invariant 2 forbids. With the flag off, the clamp is the proven one:
+  `capped at 1000000 … count=1245184 extra=65536`, then
+  `title slots past the host heap … count=934464`. That is why run 2, not run
+  1, is the configuration that matches `CLAUDE.md`.
+- **The picture is black in both runs**, with audio and a run that keeps
+  drawing (11,186 draws, mesh pipelines), so this is not device creation and
+  not the loader. `resource.rs` logs `the host refuses castable formats` on a
+  3840x2160 render-target/UAV texture at startup in run 1; that is the one
+  resource-level failure in the log and the first thing to look at.
+- **The end is still silent**: no `crashes.log` entry, no panic, no `SIGABRT`,
+  no Xid, no `NVRM`, no OOM kill. The log simply stops after a compute
+  pipeline is made.
+
+Measurement note, for every later run: `timeout` bounds the launcher, not the
+title. Run 2 returned status 124 at 90 s and the PE went on rendering for
+another ~47 s before it ended, which is the window the user watched. A bounded
+run has to kill `victory.exe` too.
